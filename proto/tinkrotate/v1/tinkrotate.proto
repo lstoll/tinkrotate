@@ -1,0 +1,6 @@
+syntax = "proto3";
+
+package com.github.lstoll.tinkrotate.v1;
+option go_package = ".;tinkrotatev1";
+
+message stub {}
