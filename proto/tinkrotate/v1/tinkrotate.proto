@@ -3,4 +3,9 @@ syntax = "proto3";
 package com.github.lstoll.tinkrotate.v1;
 option go_package = ".;tinkrotatev1";
 
-message stub {}
+import "google/protobuf/timestamp.proto";
+
+message Metadata {
+    uint32 primary_key_id  = 1 [json_name="primary_key_id"];
+    map<uint32, google.protobuf.Timestamp> key_creation_dates = 2 [json_name="key_creation_dates"];
+}
