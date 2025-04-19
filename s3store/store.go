@@ -1,4 +1,4 @@
-package keyrotation
+package s3store
 
 import (
 	"bytes"
@@ -13,10 +13,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"   // For error types like NoSuchKey
 	awshttp "github.com/aws/smithy-go/transport/http" // For response error checking
+	"github.com/lstoll/tinkrotate"
+	tinkrotatev1 "github.com/lstoll/tinkrotate/proto/tinkrotate/v1"
 	"google.golang.org/protobuf/proto"
 
-	rotationpb "path/to/your/generated/protobuf/rotationpb" // Adjust import path
+	// Adjust import path
 
+	"github.com/tink-crypto/tink-go/v2/insecurecleartextkeyset"
 	"github.com/tink-crypto/tink-go/v2/keyset"
 	"github.com/tink-crypto/tink-go/v2/tink"
 )
@@ -76,7 +79,7 @@ func NewS3Store(s3Client *s3.Client, bucket, objectKey string, opts ...S3StoreOp
 }
 
 // ReadKeysetAndMetadata implements the Store interface.
-func (s *S3Store) ReadKeysetAndMetadata(ctx context.Context) (*ReadResult, error) {
+func (s *S3Store) ReadKeysetAndMetadata(ctx context.Context) (*tinkrotate.ReadResult, error) {
 	getInput := &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(s.objectKey),
@@ -89,7 +92,7 @@ func (s *S3Store) ReadKeysetAndMetadata(ctx context.Context) (*ReadResult, error
 		if errors.As(err, &nsk) {
 			// Object doesn't exist. Return NotFound error and "" context for ETag.
 			// An empty ETag signals to Write that this should be an initial write.
-			return &ReadResult{Context: ""}, ErrKeysetNotFound
+			return &tinkrotate.ReadResult{Context: ""}, tinkrotate.ErrKeysetNotFound
 		}
 		// Handle other S3 errors
 		return nil, fmt.Errorf("failed to get object %s/%s from S3: %w", s.bucket, s.objectKey, err)
@@ -109,26 +112,23 @@ func (s *S3Store) ReadKeysetAndMetadata(ctx context.Context) (*ReadResult, error
 		return nil, fmt.Errorf("failed to unmarshal stored data JSON: %w", err)
 	}
 
-	// Decrypt keyset data if KEK is configured
-	keysetBytes := stored.KeysetData
-	if s.kek != nil {
-		// Use the object key as associated data for KEK AEAD
-		decryptedKeysetData, err := s.kek.Decrypt(keysetBytes, []byte(s.objectKey))
-		if err != nil {
-			return nil, fmt.Errorf("failed to decrypt keyset data: %w", err)
-		}
-		keysetBytes = decryptedKeysetData
-	}
-
 	// Parse keyset handle (assuming binary format)
-	reader := keyset.NewBinaryReader(bytes.NewReader(keysetBytes))
-	handle, err := keyset.Read(reader, nil) // No KEK needed here, already decrypted
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse keyset handle: %w", err)
+	var handle *keyset.Handle
+	reader := keyset.NewBinaryReader(bytes.NewReader(stored.KeysetData))
+	if s.kek != nil {
+		handle, err = keyset.ReadWithAssociatedData(reader, s.kek, []byte(s.objectKey))
+		if err != nil {
+			return nil, fmt.Errorf("failed to read keyset handle: %w", err)
+		}
+	} else {
+		handle, err = insecurecleartextkeyset.Read(reader)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read keyset handle: %w", err)
+		}
 	}
 
 	// Parse metadata
-	metadata := &rotationpb.KeyRotationMetadata{}
+	metadata := &tinkrotatev1.KeyRotationMetadata{}
 	err = proto.Unmarshal(stored.MetadataData, metadata)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal metadata protobuf: %w", err)
@@ -146,7 +146,7 @@ func (s *S3Store) ReadKeysetAndMetadata(ctx context.Context) (*ReadResult, error
 		return nil, errors.New("S3 GetObject succeeded but returned an empty ETag")
 	}
 
-	return &ReadResult{
+	return &tinkrotate.ReadResult{
 		Handle:   handle,
 		Metadata: metadata,
 		Context:  currentETag, // Pass the ETag (with quotes) as context
@@ -154,7 +154,7 @@ func (s *S3Store) ReadKeysetAndMetadata(ctx context.Context) (*ReadResult, error
 }
 
 // WriteKeysetAndMetadata implements the Store interface using conditional PutObject.
-func (s *S3Store) WriteKeysetAndMetadata(ctx context.Context, handle *keyset.Handle, metadata *rotationpb.KeyRotationMetadata, expectedContext interface{}) error {
+func (s *S3Store) WriteKeysetAndMetadata(ctx context.Context, handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationMetadata, expectedContext interface{}) error {
 	if handle == nil || metadata == nil {
 		return errors.New("handle and metadata cannot be nil for writing")
 	}
@@ -186,25 +186,21 @@ func (s *S3Store) WriteKeysetAndMetadata(ctx context.Context, handle *keyset.Han
 
 	// Serialize keyset handle (binary format)
 	keysetBuf := new(bytes.Buffer)
-	writer := keyset.NewBinaryWriter(keysetBuf)
-	err = handle.Write(writer, nil) // No KEK needed here
-	if err != nil {
-		return fmt.Errorf("failed to write keyset handle: %w", err)
-	}
-	keysetBytes := keysetBuf.Bytes()
-
-	// Encrypt keyset data if KEK is configured
 	if s.kek != nil {
-		encryptedKeysetData, err := s.kek.Encrypt(keysetBytes, []byte(s.objectKey)) // Use object key as AD
+		writer := keyset.NewBinaryWriter(keysetBuf)
+		err = handle.WriteWithAssociatedData(writer, s.kek, []byte(s.objectKey))
 		if err != nil {
-			return fmt.Errorf("failed to encrypt keyset data: %w", err)
+			return fmt.Errorf("failed to write keyset handle: %w", err)
 		}
-		keysetBytes = encryptedKeysetData
+	} else {
+		if err := insecurecleartextkeyset.Write(handle, keyset.NewBinaryWriter(keysetBuf)); err != nil {
+			return fmt.Errorf("failed to write keyset handle: %w", err)
+		}
 	}
 
 	// Combine into the stored data structure
 	stored := s3StoredData{
-		KeysetData:   keysetBytes,
+		KeysetData:   keysetBuf.Bytes(),
 		MetadataData: metadataData,
 	}
 
@@ -244,7 +240,7 @@ func (s *S3Store) WriteKeysetAndMetadata(ctx context.Context, handle *keyset.Han
 		var responseError *awshttp.ResponseError
 		if errors.As(err, &responseError) && responseError.HTTPStatusCode() == 412 {
 			// HTTP 412 Precondition Failed indicates IfMatch or IfNoneMatch failed
-			return ErrOptimisticLockFailed
+			return tinkrotate.ErrOptimisticLockFailed
 		}
 
 		// Handle other S3 errors

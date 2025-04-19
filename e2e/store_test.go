@@ -2,7 +2,6 @@ package e2e
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"reflect"
 	"sort"
@@ -48,7 +47,7 @@ func findKeyByState(metadata *tinkrotatev1.KeyRotationMetadata, state tinkrotate
 }
 
 // TestAutoRotator_SQLite_BlackBox tests the AutoRotator using SQLStore with SQLite.
-func TestAutoRotator_SQLite_BlackBox(t *testing.T) {
+func runStoreTest(t *testing.T, store tinkrotate.Store) {
 	// --- Test Configuration ---
 	policy := tinkrotate.RotationPolicy{
 		KeyTemplate:         aead.AES128GCMKeyTemplate(),
@@ -59,7 +58,6 @@ func TestAutoRotator_SQLite_BlackBox(t *testing.T) {
 	}
 	simulationDuration := 40 * time.Second // Enough for multiple cycles
 	timeStep := 1 * time.Second
-	keysetID := "test-keyset-autorotator" // ID for the keyset in the DB
 
 	// --- Mock Time Setup ---
 	startTime := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
@@ -67,20 +65,6 @@ func TestAutoRotator_SQLite_BlackBox(t *testing.T) {
 	timeNow := func() time.Time {
 		return currentTime
 	}
-
-	// --- Database Setup ---
-	// Using ":memory:" for a private in-memory database per test run
-	db, err := sql.Open("sqlite3", ":memory:")
-	require.NoError(t, err, "Failed to open in-memory sqlite db")
-	defer db.Close()
-
-	// --- Store Setup ---
-	sqlStore, err := tinkrotate.NewSQLStore(db, keysetID) // Using default table/column names
-	require.NoError(t, err, "Failed to create SQLStore")
-
-	// Create Schema
-	_, err = db.Exec(sqlStore.Schema())
-	require.NoError(t, err, "Failed to create database schema")
 
 	// --- Rotator Setup ---
 	rotator, err := tinkrotate.NewRotator(policy)
@@ -97,7 +81,7 @@ func TestAutoRotator_SQLite_BlackBox(t *testing.T) {
 	settableNowField.Set(reflect.ValueOf(timeNow))
 
 	// --- AutoRotator Setup ---
-	autoRotator, err := tinkrotate.NewAutoRotator(sqlStore, rotator, 1*time.Minute, policy.KeyTemplate) // Interval doesn't matter for RunOnce
+	autoRotator, err := tinkrotate.NewAutoRotator(store, rotator, 1*time.Minute, policy.KeyTemplate) // Interval doesn't matter for RunOnce
 	require.NoError(t, err, "Failed to create AutoRotator")
 
 	// --- Test Execution ---
@@ -109,9 +93,11 @@ func TestAutoRotator_SQLite_BlackBox(t *testing.T) {
 	var elapsedSeconds float64
 
 	t.Run("Initial State - Not Found", func(t *testing.T) {
-		_, err := sqlStore.ReadKeysetAndMetadata(ctx)
+		_, err := store.ReadKeysetAndMetadata(ctx)
 		assert.ErrorIs(t, err, tinkrotate.ErrKeysetNotFound, "Expected ErrKeysetNotFound initially")
 	})
+
+	seenContext := make(map[any]struct{})
 
 	t.Run("First Run - Provisioning", func(t *testing.T) {
 		currentTime = currentTime.Add(time.Microsecond) // Advance time slightly
@@ -119,11 +105,12 @@ func TestAutoRotator_SQLite_BlackBox(t *testing.T) {
 		require.NoError(t, err, "RunOnce failed during initial provisioning")
 
 		// Verify state in store
-		readResult, err := sqlStore.ReadKeysetAndMetadata(ctx)
+		readResult, err := store.ReadKeysetAndMetadata(ctx)
+		seenContext[readResult.Context] = struct{}{}
 		require.NoError(t, err, "Failed to read from store after provisioning")
 		require.NotNil(t, readResult.Handle, "Handle should not be nil after provisioning")
 		require.NotNil(t, readResult.Metadata, "Metadata should not be nil after provisioning")
-		assert.Equal(t, int64(1), readResult.Context, "Version should be 1 after initial write") // Check version
+		assert.Equal(t, len(seenContext), 1, "Should be one version after initial write") // Check version
 
 		ksInfo := readResult.Handle.KeysetInfo()
 		assert.NotZero(t, ksInfo.GetPrimaryKeyId(), "Should have a primary key ID")
@@ -159,7 +146,7 @@ func TestAutoRotator_SQLite_BlackBox(t *testing.T) {
 			require.NoError(t, err, "RunOnce failed during simulation loop at %.0fs", elapsed.Seconds())
 
 			// Read current state from store for verification
-			readResult, err := sqlStore.ReadKeysetAndMetadata(ctx)
+			readResult, err := store.ReadKeysetAndMetadata(ctx)
 			require.NoError(t, err, "Failed to read from store during simulation loop at %.0fs", elapsed.Seconds())
 
 			// Check consistency at every step
@@ -316,7 +303,7 @@ func TestAutoRotator_SQLite_BlackBox(t *testing.T) {
 	})
 	t.Run("Final State Verification", func(t *testing.T) {
 		// Read final state (at end of simulation, currentTime = startTime + 40s)
-		readResult, err := sqlStore.ReadKeysetAndMetadata(ctx)
+		readResult, err := store.ReadKeysetAndMetadata(ctx)
 		require.NoError(t, err, "Failed to read final state from store")
 
 		// Initial key should definitely be gone
