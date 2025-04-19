@@ -1,0 +1,41 @@
+name: Storage E2E Testing
+on: [push]
+jobs:
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+    strategy:
+      matrix:
+        go: [ stable, oldstable ]
+
+    steps:
+
+    - name: Set up Go ${{ matrix.go }}
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ matrix.go }}
+      id: go
+
+    - name: Check out code into the Go module directory
+      uses: actions/checkout@v4
+
+    - name: Get dependencies
+      run: go mod download
+      working-directory: e2e
+
+    - uses: hoverkraft-tech/compose-action@v2
+      with:
+        compose-file: "e2e/docker-compose.yaml"
+        services: |
+          minio
+
+    - name: Test
+      run: go test ./...
+      env:
+        MINIO_ADDR: http://localhost:9000
+        MINIO_ACCESS_KEY: minio
+        MINIO_SECRET_KEY: minio123
+      working-directory: e2e

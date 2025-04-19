@@ -1,6 +1,45 @@
 syntax = "proto3";
 
-package com.github.lstoll.tinkrotate.v1;
+package lstoll.tinkrotate.v1;
+
+import "google/protobuf/timestamp.proto";
+
 option go_package = ".;tinkrotatev1";
 
-message stub {}
+// KeyState defines the lifecycle state of a key within the rotation policy.
+enum KeyState {
+  KEY_STATE_UNSPECIFIED = 0; // Default, should not be used in practice
+  KEY_STATE_PENDING = 1; // Key generated, propagating, not yet primary
+  KEY_STATE_PRIMARY = 2; // Active key for signing/encryption
+  KEY_STATE_PHASING_OUT = 3; // Previous primary, used only for verification/decryption
+  KEY_STATE_DISABLED = 4; // Key is no longer used for any operation, awaiting deletion
+  // No DESTROYED/DELETED state here, as its absence from metadata implies deletion
+}
+
+// KeyMetadata stores rotation-specific information for a single key within a Tink Keyset.
+message KeyMetadata {
+  // The Tink Key ID this metadata corresponds to.
+  uint32 key_id = 1;
+
+  // The state of the key in its rotation lifecycle.
+  KeyState state = 2;
+
+  // When the key was initially generated and added to the keyset (as PENDING).
+  google.protobuf.Timestamp creation_time = 3;
+
+  // When the key was promoted to PRIMARY status. Reset if demoted.
+  google.protobuf.Timestamp promotion_time = 4; // Optional: only set when state is PRIMARY
+
+  // When the key was moved to DISABLED status.
+  google.protobuf.Timestamp disable_time = 5; // Optional: only set when state is DISABLED or later
+
+  // When the key is scheduled to be permanently deleted (destroyed) from the keyset.
+  google.protobuf.Timestamp deletion_time = 6; // Optional: only set when state is DISABLED
+}
+
+// KeyRotationMetadata encapsulates metadata for all keys in a managed keyset.
+message KeyRotationMetadata {
+  map<uint32, KeyMetadata> key_metadata = 1;
+
+  // TODO - generic metadata and space for keyset bytes
+}

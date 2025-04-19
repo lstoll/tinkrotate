@@ -1,0 +1,14 @@
+services:
+  minio:
+    image: quay.io/minio/minio:latest
+    ports:
+      - "9000:9000"
+    environment:
+      - "MINIO_ROOT_USER=minio"
+      - "MINIO_ROOT_PASSWORD=minio123"
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: mc ready local || exit 1
+      interval: 1s
+      timeout: 1s
+      retries: 10
