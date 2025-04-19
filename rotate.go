@@ -39,7 +39,7 @@ func NewRotator(policy RotationPolicy) (*Rotator, error) {
 	}
 	if policy.PropagationTime > policy.PrimaryDuration {
 		// Allow propagation == primary duration (immediate rotation after propagation)
-		// return nil, errors.New("propagation time cannot be longer than primary duration")
+		return nil, errors.New("propagation time cannot be longer than primary duration")
 	}
 	return &Rotator{
 		Policy: policy,

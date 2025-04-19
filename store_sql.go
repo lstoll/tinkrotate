@@ -206,7 +206,7 @@ func (s *SQLStore) WriteKeysetAndMetadata(ctx context.Context, handle *keyset.Ha
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback() // Rollback if commit doesn't happen
+	defer func() { _ = tx.Rollback() }() // Rollback if commit doesn't happen
 
 	var res sql.Result
 	if isInsert {

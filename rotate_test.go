@@ -237,13 +237,6 @@ func requireNoError(t testing.TB, err error, msg string, args ...any) {
 	}
 }
 
-func assertEqual[T comparable](t testing.TB, a, b T, msg string, args ...any) {
-	t.Helper()
-	if a != b {
-		t.Fatalf("should be equal, but was: %v. %s", b, fmt.Sprintf(msg, args...))
-	}
-}
-
 func assertEqualBytes(t testing.TB, a, b []byte, msg string, args ...any) {
 	t.Helper()
 	if !bytes.Equal(a, b) {
