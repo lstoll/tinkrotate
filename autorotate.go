@@ -41,7 +41,7 @@ type AutoRotatorOption func(*AutoRotator)
 // checkInterval: How often to check if rotation is needed.
 // keyTemplate: The template used ONLY for creating the very first keyset if none exists.
 // opts: Optional configuration settings.
-func NewAutoRotator(store Store, rotator *Rotator, checkInterval time.Duration, keyTemplate *tinkpb.KeyTemplate, opts ...AutoRotatorOption) (*AutoRotator, error) {
+func NewAutoRotator(store Store, rotator *Rotator, checkInterval time.Duration, opts ...AutoRotatorOption) (*AutoRotator, error) {
 	if store == nil {
 		return nil, errors.New("store cannot be nil")
 	}
@@ -51,15 +51,12 @@ func NewAutoRotator(store Store, rotator *Rotator, checkInterval time.Duration, 
 	if checkInterval <= 0 {
 		return nil, errors.New("checkInterval must be positive")
 	}
-	if keyTemplate == nil {
-		return nil, errors.New("keyTemplate cannot be nil (needed for initial provisioning)")
-	}
 
 	ar := &AutoRotator{
 		store:         store,
 		rotator:       rotator,
 		checkInterval: checkInterval,
-		keyTemplate:   keyTemplate,
+		keyTemplate:   rotator.Policy.KeyTemplate,
 		running:       false,
 	}
 
@@ -260,4 +257,14 @@ func (ar *AutoRotator) Stop() {
 	log.Println("AutoRotator: Waiting for background routine to shut down...")
 	ar.shutdownWg.Wait() // Wait for the goroutine to finish
 	log.Println("AutoRotator: Background routine shut down complete.")
+}
+
+// GetCurrentHandle returns the current keyset handle from the store.
+// It returns ErrKeysetNotFound if no keyset exists.
+func (ar *AutoRotator) GetCurrentHandle(ctx context.Context) (*keyset.Handle, error) {
+	result, err := ar.store.ReadKeysetAndMetadata(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return result.Handle, nil
 }

@@ -81,7 +81,7 @@ func runStoreTest(t *testing.T, store tinkrotate.Store) {
 	settableNowField.Set(reflect.ValueOf(timeNow))
 
 	// --- AutoRotator Setup ---
-	autoRotator, err := tinkrotate.NewAutoRotator(store, rotator, 1*time.Minute, policy.KeyTemplate) // Interval doesn't matter for RunOnce
+	autoRotator, err := tinkrotate.NewAutoRotator(store, rotator, 1*time.Minute) // Interval doesn't matter for RunOnce
 	require.NoError(t, err, "Failed to create AutoRotator")
 
 	// --- Test Execution ---
