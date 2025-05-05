@@ -15,11 +15,12 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+var _ ManagedStore = (*SQLStore)(nil)
+
 // SQLStore implements the Store interface using a relational database via database/sql.
 // It assumes a simple schema with one row per managed keyset.
 type SQLStore struct {
 	db        *sql.DB
-	keysetID  string    // Identifier for the keyset row in the table
 	kek       tink.AEAD // Optional: Key-Encryption-Key for encrypting the keyset handle data
 	tableName string    // Name of the database table
 }
@@ -34,19 +35,14 @@ type SQLStoreOptions struct {
 
 // NewSQLStore creates a new SQLStore instance.
 // db: An initialized *sql.DB connection pool.
-// keysetID: A unique identifier for the keyset row managed by this store instance.
 // opts: Optional configuration settings. If nil, defaults will be used.
-func NewSQLStore(db *sql.DB, keysetID string, opts *SQLStoreOptions) (*SQLStore, error) {
+func NewSQLStore(db *sql.DB, opts *SQLStoreOptions) (*SQLStore, error) {
 	if db == nil {
 		return nil, errors.New("sql database connection cannot be nil")
-	}
-	if keysetID == "" {
-		return nil, errors.New("keysetID cannot be empty")
 	}
 
 	s := &SQLStore{
 		db:        db,
-		keysetID:  keysetID,
 		tableName: "tink_keysets", // Default table name
 	}
 
@@ -68,6 +64,7 @@ func NewSQLStore(db *sql.DB, keysetID string, opts *SQLStoreOptions) (*SQLStore,
 
 // Schema returns a basic schema suggestion for the table used by SQLStore.
 // Adjust types (BLOB, INTEGER) based on your specific SQL dialect.
+// The 'id' column stores the unique keysetName.
 func (s *SQLStore) Schema() string {
 	return fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s (
@@ -78,30 +75,28 @@ CREATE TABLE IF NOT EXISTS %s (
 );`, s.tableName, "id", "keyset_data", "metadata_data", "version")
 }
 
-// ReadKeysetAndMetadata implements the Store interface.
-func (s *SQLStore) ReadKeysetAndMetadata(ctx context.Context) (*ReadResult, error) {
+// ReadKeysetAndMetadata implements the ManagedStore interface.
+func (s *SQLStore) ReadKeysetAndMetadata(ctx context.Context, keysetName string) (*ReadResult, error) {
 	query := fmt.Sprintf("SELECT %s, %s, %s FROM %s WHERE %s = ?",
-		"keyset_data", "metadata_data", "version", s.tableName, "id") // Hardcoded column names
+		"keyset_data", "metadata_data", "version", s.tableName, "id")
 
 	var keysetData, metadataData []byte
-	var version int64 // Use int64 for version
+	var version int64
 
-	row := s.db.QueryRowContext(ctx, query, s.keysetID)
+	row := s.db.QueryRowContext(ctx, query, keysetName)
 	err := row.Scan(&keysetData, &metadataData, &version)
 
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			// Return version 0 in context to indicate non-existence for Write operation
 			return &ReadResult{Context: int64(0)}, ErrKeysetNotFound
 		}
 		return nil, fmt.Errorf("failed to query keyset row: %w", err)
 	}
 
-	// Decrypt keyset data if KEK is configured
 	if s.kek != nil {
-		decryptedKeysetData, err := s.kek.Decrypt(keysetData, []byte(s.keysetID)) // Use keysetID as associated data
+		decryptedKeysetData, err := s.kek.Decrypt(keysetData, []byte(keysetName))
 		if err != nil {
-			return nil, fmt.Errorf("failed to decrypt keyset data: %w", err)
+			return nil, fmt.Errorf("failed to decrypt keyset data for '%s': %w", keysetName, err)
 		}
 		keysetData = decryptedKeysetData
 	}
@@ -109,25 +104,23 @@ func (s *SQLStore) ReadKeysetAndMetadata(ctx context.Context) (*ReadResult, erro
 	var handle *keyset.Handle
 	reader := keyset.NewBinaryReader(bytes.NewReader(keysetData))
 	if s.kek != nil {
-		handle, err = keyset.ReadWithAssociatedData(reader, s.kek, []byte(s.keysetID))
+		handle, err = keyset.ReadWithAssociatedData(reader, s.kek, []byte(keysetName))
 		if err != nil {
-			return nil, fmt.Errorf("failed to read keyset handle: %w", err)
+			return nil, fmt.Errorf("failed to read encrypted keyset handle for '%s': %w", keysetName, err)
 		}
 	} else {
 		handle, err = insecurecleartextkeyset.Read(reader)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read keyset handle: %w", err)
+			return nil, fmt.Errorf("failed to read cleartext keyset handle for '%s': %w", keysetName, err)
 		}
 	}
 
-	// Parse metadata
 	metadata := &tinkrotatev1.KeyRotationMetadata{}
 	err = proto.Unmarshal(metadataData, metadata)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal metadata protobuf: %w", err)
+		return nil, fmt.Errorf("failed to unmarshal metadata protobuf for '%s': %w", keysetName, err)
 	}
 
-	// Return data and the version read as context
 	return &ReadResult{
 		Handle:   handle,
 		Metadata: metadata,
@@ -135,99 +128,176 @@ func (s *SQLStore) ReadKeysetAndMetadata(ctx context.Context) (*ReadResult, erro
 	}, nil
 }
 
-// WriteKeysetAndMetadata implements the Store interface.
-func (s *SQLStore) WriteKeysetAndMetadata(ctx context.Context, handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationMetadata, expectedContext interface{}) error {
+// WriteKeysetAndMetadata implements the ManagedStore interface.
+func (s *SQLStore) WriteKeysetAndMetadata(ctx context.Context, keysetName string, handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationMetadata, expectedContext interface{}) error {
 	if handle == nil || metadata == nil {
 		return errors.New("handle and metadata cannot be nil for writing")
 	}
 
-	// Determine expected version for optimistic locking
 	var expectedVersion int64
 	isInsert := false
 	if expectedContext == nil {
-		// Assume initial write if context is nil
 		isInsert = true
-		expectedVersion = 0 // For logic below, though not used in INSERT directly
+		expectedVersion = 0
 	} else {
 		v, ok := expectedContext.(int64)
 		if !ok {
 			return fmt.Errorf("invalid expectedContext type: expected int64, got %T", expectedContext)
 		}
 		if v == 0 {
-			// Version 0 indicates the record should not exist yet (initial write)
 			isInsert = true
 		}
 		expectedVersion = v
 	}
 
-	// Serialize metadata
 	metadataData, err := proto.Marshal(metadata)
 	if err != nil {
 		return fmt.Errorf("failed to marshal metadata protobuf: %w", err)
 	}
 
-	// Serialize keyset handle (binary format)
 	keysetBuf := new(bytes.Buffer)
 	if s.kek != nil {
 		writer := keyset.NewBinaryWriter(keysetBuf)
-		err = handle.WriteWithAssociatedData(writer, s.kek, []byte(s.keysetID))
+		err = handle.WriteWithAssociatedData(writer, s.kek, []byte(keysetName))
 		if err != nil {
-			return fmt.Errorf("failed to write keyset handle: %w", err)
+			return fmt.Errorf("failed to write encrypted keyset handle for '%s': %w", keysetName, err)
 		}
 	} else {
 		if err := insecurecleartextkeyset.Write(handle, keyset.NewBinaryWriter(keysetBuf)); err != nil {
-			return fmt.Errorf("failed to write keyset handle: %w", err)
+			return fmt.Errorf("failed to write cleartext keyset handle for '%s': %w", keysetName, err)
 		}
 	}
 
-	// --- Database Transaction ---
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }() // Rollback if commit doesn't happen
+	defer func() { _ = tx.Rollback() }()
 
 	var res sql.Result
 	if isInsert {
-		// Initial write (INSERT)
 		query := fmt.Sprintf("INSERT INTO %s (%s, %s, %s, %s) VALUES (?, ?, ?, ?)",
-			s.tableName, "id", "keyset_data", "metadata_data", "version") // Hardcoded column names
-		newVersion := int64(1) // Start versioning at 1
-		res, err = tx.ExecContext(ctx, query, s.keysetID, keysetBuf.Bytes(), metadataData, newVersion)
+			s.tableName, "id", "keyset_data", "metadata_data", "version")
+		newVersion := int64(1)
+		res, err = tx.ExecContext(ctx, query, keysetName, keysetBuf.Bytes(), metadataData, newVersion)
 		if err != nil {
-			// Handle potential race condition if another process inserted first (e.g., unique constraint violation)
-			// This depends heavily on the DB driver and schema constraints.
-			// A simple check for existing row before insert might be needed, or rely on constraint violation error.
-			return fmt.Errorf("failed to insert keyset row: %w", err)
+			return fmt.Errorf("failed to insert keyset row for '%s': %w", keysetName, err)
 		}
 	} else {
-		// Update existing row with optimistic lock check
 		query := fmt.Sprintf("UPDATE %s SET %s = ?, %s = ?, %s = ? WHERE %s = ? AND %s = ?",
-			s.tableName, "keyset_data", "metadata_data", "version", "id", "version") // Hardcoded column names
+			s.tableName, "keyset_data", "metadata_data", "version", "id", "version")
 		newVersion := expectedVersion + 1
-		res, err = tx.ExecContext(ctx, query, keysetBuf.Bytes(), metadataData, newVersion, s.keysetID, expectedVersion)
+		res, err = tx.ExecContext(ctx, query, keysetBuf.Bytes(), metadataData, newVersion, keysetName, expectedVersion)
 		if err != nil {
-			return fmt.Errorf("failed to update keyset row: %w", err)
+			return fmt.Errorf("failed to update keyset row for '%s': %w", keysetName, err)
 		}
 	}
 
-	// Check rows affected for optimistic lock
 	rowsAffected, err := res.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("failed to get rows affected: %w", err)
 	}
 
 	if rowsAffected == 0 {
-		// If INSERT failed silently (no error but 0 rows), or UPDATE matched 0 rows.
-		// This indicates the optimistic lock failed (either key already existed for INSERT,
-		// or version mismatch for UPDATE).
 		return ErrOptimisticLockFailed
 	}
 
-	// Commit the transaction
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	return nil
+}
+
+// ForEachKeyset implements the ManagedStore interface.
+func (s *SQLStore) ForEachKeyset(ctx context.Context, fn func(keysetName string) error) error {
+	query := fmt.Sprintf("SELECT DISTINCT %s FROM %s", "id", s.tableName)
+
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return fmt.Errorf("failed to query distinct keyset names: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var keysetName string
+		if err := rows.Scan(&keysetName); err != nil {
+			return fmt.Errorf("failed to scan keyset name: %w", err)
+		}
+
+		if err := fn(keysetName); err != nil {
+			// If the callback function returns an error, stop iteration and return it.
+			return fmt.Errorf("callback function failed for keyset '%s': %w", keysetName, err)
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		// Check for errors during iteration
+		return fmt.Errorf("error during keyset name iteration: %w", err)
+	}
+
+	return nil
+}
+
+// GetCurrentHandle implements the Store interface.
+func (s *SQLStore) GetCurrentHandle(ctx context.Context, keysetName string) (*keyset.Handle, error) {
+	query := fmt.Sprintf("SELECT %s, %s FROM %s WHERE %s = ?",
+		"keyset_data", "version", s.tableName, "id") // Select keyset_data and version
+
+	var keysetData []byte
+	var version int64 // Need version for KEK associated data consistency
+
+	row := s.db.QueryRowContext(ctx, query, keysetName)
+	err := row.Scan(&keysetData, &version)
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("keyset '%s': %w", keysetName, ErrKeysetNotFound)
+		}
+		return nil, fmt.Errorf("failed to query keyset data for '%s': %w", keysetName, err)
+	}
+
+	// Decrypt keyset data if KEK is configured
+	if s.kek != nil {
+		decryptedKeysetData, err := s.kek.Decrypt(keysetData, []byte(keysetName)) // Use keysetName as associated data
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt keyset data for '%s': %w", keysetName, err)
+		}
+		keysetData = decryptedKeysetData
+	}
+
+	// Read the handle
+	var handle *keyset.Handle
+	reader := keyset.NewBinaryReader(bytes.NewReader(keysetData))
+	if s.kek != nil {
+		// Must use ReadWithAssociatedData if KEK was used for writing/decryption
+		handle, err = keyset.ReadWithAssociatedData(reader, s.kek, []byte(keysetName))
+		if err != nil {
+			return nil, fmt.Errorf("failed to read encrypted keyset handle for '%s': %w", keysetName, err)
+		}
+	} else {
+		handle, err = insecurecleartextkeyset.Read(reader)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read cleartext keyset handle for '%s': %w", keysetName, err)
+		}
+	}
+
+	return handle, nil
+}
+
+// GetPublicKeySetHandle implements the Store interface.
+func (s *SQLStore) GetPublicKeySetHandle(ctx context.Context, keysetName string) (*keyset.Handle, error) {
+	privateHandle, err := s.GetCurrentHandle(ctx, keysetName)
+	if err != nil {
+		// Error from GetCurrentHandle already includes context (e.g., ErrKeysetNotFound)
+		return nil, err
+	}
+
+	// Get the public handle
+	publicHandle, err := privateHandle.Public()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get public handle for keyset '%s': %w", keysetName, err)
+	}
+
+	return publicHandle, nil
 }
