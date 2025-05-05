@@ -18,7 +18,7 @@ func TestAutoRotator_SQLite_BlackBox(t *testing.T) {
 	defer db.Close()
 
 	// --- Store Setup ---
-	sqlStore, err := tinkrotate.NewSQLStore(db, keysetID) // Using default table/column names
+	sqlStore, err := tinkrotate.NewSQLStore(db, keysetID, nil) // Using default table/column names
 	require.NoError(t, err, "Failed to create SQLStore")
 
 	// Create Schema

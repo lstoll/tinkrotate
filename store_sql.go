@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	tinkrotatev1 "github.com/lstoll/tinkrotate/proto/tinkrotate/v1"
 	"github.com/tink-crypto/tink-go/v2/insecurecleartextkeyset"
@@ -17,47 +18,25 @@ import (
 // SQLStore implements the Store interface using a relational database via database/sql.
 // It assumes a simple schema with one row per managed keyset.
 type SQLStore struct {
-	db          *sql.DB
-	keysetID    string    // Identifier for the keyset row in the table
-	kek         tink.AEAD // Optional: Key-Encryption-Key for encrypting the keyset handle data
-	tableName   string    // Name of the database table
-	idCol       string    // Name of the ID column
-	keysetCol   string    // Name of the keyset data column (BLOB)
-	metadataCol string    // Name of the metadata column (BLOB)
-	versionCol  string    // Name of the version column (INTEGER)
+	db        *sql.DB
+	keysetID  string    // Identifier for the keyset row in the table
+	kek       tink.AEAD // Optional: Key-Encryption-Key for encrypting the keyset handle data
+	tableName string    // Name of the database table
 }
 
-// SQLStoreOption is used to configure SQLStore.
-type SQLStoreOption func(*SQLStore)
-
-// WithSQLTableName sets the table name (default: "tink_keysets").
-func WithSQLTableName(name string) SQLStoreOption {
-	return func(s *SQLStore) {
-		s.tableName = name
-	}
-}
-
-// WithSQLColumnNames sets custom column names.
-func WithSQLColumnNames(id, keyset, metadata, version string) SQLStoreOption {
-	return func(s *SQLStore) {
-		s.idCol = id
-		s.keysetCol = keyset
-		s.metadataCol = metadata
-		s.versionCol = version
-	}
-}
-
-// WithSQLKEK provides a Tink AEAD primitive to encrypt/decrypt the keyset data.
-func WithSQLKEK(kek tink.AEAD) SQLStoreOption {
-	return func(s *SQLStore) {
-		s.kek = kek
-	}
+// SQLStoreOptions holds configuration options for SQLStore.
+type SQLStoreOptions struct {
+	// KEK is an optional Tink AEAD primitive to encrypt/decrypt the keyset data.
+	KEK tink.AEAD
+	// TableName specifies the name of the database table (default: "tink_keysets").
+	TableName string
 }
 
 // NewSQLStore creates a new SQLStore instance.
 // db: An initialized *sql.DB connection pool.
 // keysetID: A unique identifier for the keyset row managed by this store instance.
-func NewSQLStore(db *sql.DB, keysetID string, opts ...SQLStoreOption) (*SQLStore, error) {
+// opts: Optional configuration settings. If nil, defaults will be used.
+func NewSQLStore(db *sql.DB, keysetID string, opts *SQLStoreOptions) (*SQLStore, error) {
 	if db == nil {
 		return nil, errors.New("sql database connection cannot be nil")
 	}
@@ -66,23 +45,23 @@ func NewSQLStore(db *sql.DB, keysetID string, opts ...SQLStoreOption) (*SQLStore
 	}
 
 	s := &SQLStore{
-		db:          db,
-		keysetID:    keysetID,
-		tableName:   "tink_keysets", // Default table name
-		idCol:       "id",           // Default column names
-		keysetCol:   "keyset_data",
-		metadataCol: "metadata_data",
-		versionCol:  "version",
+		db:        db,
+		keysetID:  keysetID,
+		tableName: "tink_keysets", // Default table name
 	}
 
-	for _, opt := range opts {
-		opt(s)
+	if opts != nil {
+		if opts.TableName != "" {
+			s.tableName = opts.TableName
+		}
+		if opts.KEK != nil {
+			s.kek = opts.KEK
+		}
 	}
 
-	// Basic validation that KEK is provided if needed (optional)
-	// if s.kek == nil {
-	//  log.Println("Warning: SQLStore created without KEK, keyset data will be stored unencrypted.")
-	// }
+	if s.kek == nil {
+		slog.Warn("SQLStore created without KEK, keyset data will be stored unencrypted.")
+	}
 
 	return s, nil
 }
@@ -96,13 +75,13 @@ CREATE TABLE IF NOT EXISTS %s (
     %s BLOB NOT NULL,
     %s BLOB NOT NULL,
     %s INTEGER NOT NULL
-);`, s.tableName, s.idCol, s.keysetCol, s.metadataCol, s.versionCol)
+);`, s.tableName, "id", "keyset_data", "metadata_data", "version")
 }
 
 // ReadKeysetAndMetadata implements the Store interface.
 func (s *SQLStore) ReadKeysetAndMetadata(ctx context.Context) (*ReadResult, error) {
 	query := fmt.Sprintf("SELECT %s, %s, %s FROM %s WHERE %s = ?",
-		s.keysetCol, s.metadataCol, s.versionCol, s.tableName, s.idCol)
+		"keyset_data", "metadata_data", "version", s.tableName, "id") // Hardcoded column names
 
 	var keysetData, metadataData []byte
 	var version int64 // Use int64 for version
@@ -212,7 +191,7 @@ func (s *SQLStore) WriteKeysetAndMetadata(ctx context.Context, handle *keyset.Ha
 	if isInsert {
 		// Initial write (INSERT)
 		query := fmt.Sprintf("INSERT INTO %s (%s, %s, %s, %s) VALUES (?, ?, ?, ?)",
-			s.tableName, s.idCol, s.keysetCol, s.metadataCol, s.versionCol)
+			s.tableName, "id", "keyset_data", "metadata_data", "version") // Hardcoded column names
 		newVersion := int64(1) // Start versioning at 1
 		res, err = tx.ExecContext(ctx, query, s.keysetID, keysetBuf.Bytes(), metadataData, newVersion)
 		if err != nil {
@@ -224,7 +203,7 @@ func (s *SQLStore) WriteKeysetAndMetadata(ctx context.Context, handle *keyset.Ha
 	} else {
 		// Update existing row with optimistic lock check
 		query := fmt.Sprintf("UPDATE %s SET %s = ?, %s = ?, %s = ? WHERE %s = ? AND %s = ?",
-			s.tableName, s.keysetCol, s.metadataCol, s.versionCol, s.idCol, s.versionCol)
+			s.tableName, "keyset_data", "metadata_data", "version", "id", "version") // Hardcoded column names
 		newVersion := expectedVersion + 1
 		res, err = tx.ExecContext(ctx, query, keysetBuf.Bytes(), metadataData, newVersion, s.keysetID, expectedVersion)
 		if err != nil {
