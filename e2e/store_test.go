@@ -47,7 +47,7 @@ func findKeyByState(metadata *tinkrotatev1.KeyRotationMetadata, state tinkrotate
 }
 
 // TestAutoRotator_SQLite_BlackBox tests the AutoRotator using SQLStore with SQLite.
-func runStoreTest(t *testing.T, store tinkrotate.Store) {
+func runStoreTest(t *testing.T, store tinkrotate.ManagedStore, keysetName string) {
 	// --- Test Configuration ---
 	policy := tinkrotate.RotationPolicy{
 		KeyTemplate:         aead.AES128GCMKeyTemplate(),
@@ -93,7 +93,7 @@ func runStoreTest(t *testing.T, store tinkrotate.Store) {
 	var elapsedSeconds float64
 
 	t.Run("Initial State - Not Found", func(t *testing.T) {
-		_, err := store.ReadKeysetAndMetadata(ctx)
+		_, err := store.ReadKeysetAndMetadata(ctx, keysetName)
 		assert.ErrorIs(t, err, tinkrotate.ErrKeysetNotFound, "Expected ErrKeysetNotFound initially")
 	})
 
@@ -105,7 +105,7 @@ func runStoreTest(t *testing.T, store tinkrotate.Store) {
 		require.NoError(t, err, "RunOnce failed during initial provisioning")
 
 		// Verify state in store
-		readResult, err := store.ReadKeysetAndMetadata(ctx)
+		readResult, err := store.ReadKeysetAndMetadata(ctx, keysetName)
 		seenContext[readResult.Context] = struct{}{}
 		require.NoError(t, err, "Failed to read from store after provisioning")
 		require.NotNil(t, readResult.Handle, "Handle should not be nil after provisioning")
@@ -146,7 +146,7 @@ func runStoreTest(t *testing.T, store tinkrotate.Store) {
 			require.NoError(t, err, "RunOnce failed during simulation loop at %.0fs", elapsed.Seconds())
 
 			// Read current state from store for verification
-			readResult, err := store.ReadKeysetAndMetadata(ctx)
+			readResult, err := store.ReadKeysetAndMetadata(ctx, keysetName)
 			require.NoError(t, err, "Failed to read from store during simulation loop at %.0fs", elapsed.Seconds())
 
 			// Check consistency at every step
@@ -303,7 +303,7 @@ func runStoreTest(t *testing.T, store tinkrotate.Store) {
 	})
 	t.Run("Final State Verification", func(t *testing.T) {
 		// Read final state (at end of simulation, currentTime = startTime + 40s)
-		readResult, err := store.ReadKeysetAndMetadata(ctx)
+		readResult, err := store.ReadKeysetAndMetadata(ctx, keysetName)
 		require.NoError(t, err, "Failed to read final state from store")
 
 		// Initial key should definitely be gone

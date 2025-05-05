@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 
 	// For ETag handling
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -24,6 +25,8 @@ import (
 	"github.com/tink-crypto/tink-go/v2/tink"
 )
 
+var _ tinkrotate.ManagedStore = (*S3Store)(nil) // Ensure implementation
+
 // s3StoredData is the structure persisted as a JSON object in S3.
 type s3StoredData struct {
 	KeysetData   []byte `json:"keyset_data"`
@@ -33,6 +36,8 @@ type s3StoredData struct {
 // S3Store implements the Store interface using AWS S3.
 // It stores the keyset and metadata combined in a single JSON object.
 // Conditional writes are handled using S3 ETags (IfMatch / IfNoneMatch).
+// NOTE: This implementation manages only a SINGLE keyset defined by the objectKey.
+// The keysetName parameter in interface methods is ignored.
 type S3Store struct {
 	s3Client  *s3.Client
 	bucket    string
@@ -78,8 +83,10 @@ func NewS3Store(s3Client *s3.Client, bucket, objectKey string, opts ...S3StoreOp
 	return s, nil
 }
 
-// ReadKeysetAndMetadata implements the Store interface.
-func (s *S3Store) ReadKeysetAndMetadata(ctx context.Context) (*tinkrotate.ReadResult, error) {
+// ReadKeysetAndMetadata implements the ManagedStore interface.
+// NOTE: The keysetName parameter is ignored as S3Store manages a single object.
+func (s *S3Store) ReadKeysetAndMetadata(ctx context.Context, keysetName string) (*tinkrotate.ReadResult, error) {
+	slog.Debug("S3Store: ReadKeysetAndMetadata called", "bucket", s.bucket, "objectKey", s.objectKey, "ignoredKeysetName", keysetName)
 	getInput := &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(s.objectKey),
@@ -153,8 +160,10 @@ func (s *S3Store) ReadKeysetAndMetadata(ctx context.Context) (*tinkrotate.ReadRe
 	}, nil
 }
 
-// WriteKeysetAndMetadata implements the Store interface using conditional PutObject.
-func (s *S3Store) WriteKeysetAndMetadata(ctx context.Context, handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationMetadata, expectedContext interface{}) error {
+// WriteKeysetAndMetadata implements the ManagedStore interface using conditional PutObject.
+// NOTE: The keysetName parameter is ignored as S3Store manages a single object.
+func (s *S3Store) WriteKeysetAndMetadata(ctx context.Context, keysetName string, handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationMetadata, expectedContext interface{}) error {
+	slog.Debug("S3Store: WriteKeysetAndMetadata called", "bucket", s.bucket, "objectKey", s.objectKey, "ignoredKeysetName", keysetName)
 	if handle == nil || metadata == nil {
 		return errors.New("handle and metadata cannot be nil for writing")
 	}
@@ -248,5 +257,54 @@ func (s *S3Store) WriteKeysetAndMetadata(ctx context.Context, handle *keyset.Han
 	}
 
 	// Success
+	return nil
+}
+
+// GetCurrentHandle implements the Store interface.
+// NOTE: The keysetName parameter is ignored as S3Store manages a single object.
+func (s *S3Store) GetCurrentHandle(ctx context.Context, keysetName string) (*keyset.Handle, error) {
+	slog.Debug("S3Store: GetCurrentHandle called", "bucket", s.bucket, "objectKey", s.objectKey, "ignoredKeysetName", keysetName)
+	readResult, err := s.ReadKeysetAndMetadata(ctx, keysetName) // Use existing read logic
+	if err != nil {
+		// Map ErrKeysetNotFound correctly
+		if errors.Is(err, tinkrotate.ErrKeysetNotFound) {
+			return nil, fmt.Errorf("keyset '%s': %w", s.objectKey, tinkrotate.ErrKeysetNotFound)
+		}
+		return nil, fmt.Errorf("failed to read for GetCurrentHandle: %w", err)
+	}
+	if readResult.Handle == nil {
+		// Should not happen if ReadKeysetAndMetadata returns nil error without ErrKeysetNotFound
+		return nil, fmt.Errorf("internal error: ReadKeysetAndMetadata succeeded but returned nil handle for %s", s.objectKey)
+	}
+	return readResult.Handle, nil
+}
+
+// GetPublicKeySetHandle implements the Store interface.
+// NOTE: The keysetName parameter is ignored as S3Store manages a single object.
+func (s *S3Store) GetPublicKeySetHandle(ctx context.Context, keysetName string) (*keyset.Handle, error) {
+	slog.Debug("S3Store: GetPublicKeySetHandle called", "bucket", s.bucket, "objectKey", s.objectKey, "ignoredKeysetName", keysetName)
+	fullHandle, err := s.GetCurrentHandle(ctx, keysetName)
+	if err != nil {
+		return nil, err // Error already includes context/wrapping
+	}
+	// Extract public keyset handle
+	publicHandle, err := fullHandle.Public()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get public keyset handle for '%s': %w", s.objectKey, err)
+	}
+	return publicHandle, nil
+}
+
+// ForEachKeyset implements the ManagedStore interface.
+// NOTE: Since S3Store manages only a single keyset defined by its objectKey,
+// this function simply calls the callback `fn` once with the store's objectKey.
+func (s *S3Store) ForEachKeyset(ctx context.Context, fn func(keysetName string) error) error {
+	slog.Debug("S3Store: ForEachKeyset called", "bucket", s.bucket, "objectKey", s.objectKey)
+	// Call the function with the only keyset name this store knows about.
+	err := fn(s.objectKey)
+	if err != nil {
+		// If the callback function returns an error, return it wrapped.
+		return fmt.Errorf("callback function failed for S3 keyset '%s': %w", s.objectKey, err)
+	}
 	return nil
 }

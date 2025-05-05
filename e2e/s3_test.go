@@ -70,9 +70,10 @@ func TestAutoRotator_S3_BlackBox(t *testing.T) {
 		}
 	})
 
-	store, err := s3store.NewS3Store(client, bucketName, "test-key")
+	keysetName := "test-key"
+	store, err := s3store.NewS3Store(client, bucketName, keysetName)
 	if err != nil {
 		t.Fatalf("failed to create S3 store: %v", err)
 	}
-	runStoreTest(t, store)
+	runStoreTest(t, store, keysetName)
 }
