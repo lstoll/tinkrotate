@@ -82,7 +82,7 @@ func runStoreTest(t *testing.T, store tinkrotate.ManagedStore, keysetName string
 
 	// --- AutoRotator Setup ---
 	// Tell the rotator which keyset name we are testing explicitly
-	autoRotator, err := tinkrotate.NewAutoRotator(store, rotator, 1*time.Minute, tinkrotate.WithTargetKeysetNames(keysetName))
+	autoRotator, err := tinkrotate.NewAutoRotator(store, rotator, 1*time.Minute, &tinkrotate.AutoRotatorOpts{ProvisionKeysetNames: []string{keysetName}})
 	require.NoError(t, err, "Failed to create AutoRotator")
 
 	// --- Test Execution ---
