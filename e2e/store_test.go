@@ -81,7 +81,8 @@ func runStoreTest(t *testing.T, store tinkrotate.ManagedStore, keysetName string
 	settableNowField.Set(reflect.ValueOf(timeNow))
 
 	// --- AutoRotator Setup ---
-	autoRotator, err := tinkrotate.NewAutoRotator(store, rotator, 1*time.Minute) // Interval doesn't matter for RunOnce
+	// Tell the rotator which keyset name we are testing explicitly
+	autoRotator, err := tinkrotate.NewAutoRotator(store, rotator, 1*time.Minute, tinkrotate.WithTargetKeysetNames(keysetName))
 	require.NoError(t, err, "Failed to create AutoRotator")
 
 	// --- Test Execution ---

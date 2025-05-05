@@ -29,10 +29,20 @@ type AutoRotator struct {
 	stopChan   chan struct{}      // Signals the background goroutine to stop
 	shutdownWg sync.WaitGroup     // Waits for the background goroutine to finish
 	cancelCtx  context.CancelFunc // Cancels the context used by the background routine
+
+	// Optional: Specific keyset names to ensure are processed by RunOnce, even if not found by ForEachKeyset initially.
+	targetKeysetNames []string
 }
 
 // AutoRotatorOption allows configuring the AutoRotator.
 type AutoRotatorOption func(*AutoRotator)
+
+// WithTargetKeysetNames sets specific keyset names that RunOnce should always attempt to process.
+func WithTargetKeysetNames(names ...string) AutoRotatorOption {
+	return func(ar *AutoRotator) {
+		ar.targetKeysetNames = names
+	}
+}
 
 // NewAutoRotator creates a new AutoRotator.
 // store: The persistence layer implementation.
@@ -72,29 +82,49 @@ func NewAutoRotator(store ManagedStore, rotator *Rotator, checkInterval time.Dur
 // state back to the store only if needed.
 func (ar *AutoRotator) RunOnce(ctx context.Context) error {
 	log.Println("AutoRotator: Starting rotation check cycle for all keysets...")
-	var firstError error // Keep track of the first error encountered
+	var firstError error                       // Keep track of the first error encountered
+	processedKeys := make(map[string]struct{}) // Track keys processed via ForEachKeyset
 
+	// Process keys found in the store
 	err := ar.store.ForEachKeyset(ctx, func(keysetName string) error {
-		log.Printf("AutoRotator: Processing keyset '%s'...", keysetName)
+		log.Printf("AutoRotator: Processing existing keyset '%s' found via ForEachKeyset...", keysetName)
+		processedKeys[keysetName] = struct{}{}
 		runErr := ar.processSingleKeyset(ctx, keysetName)
 		if runErr != nil {
 			log.Printf("AutoRotator: Error processing keyset '%s': %v", keysetName, runErr)
 			if firstError == nil {
 				firstError = fmt.Errorf("error processing keyset '%s': %w", keysetName, runErr)
 			}
-			// Decide if we should continue processing other keysets or stop.
-			// For now, let's continue to attempt rotating others.
 		}
 		return nil // Continue iteration even if one keyset fails
 	})
 
 	if err != nil {
 		// This error comes from ForEachKeyset itself (e.g., failed DB connection)
-		return fmt.Errorf("failed iterating keysets in store: %w", err)
+		if firstError == nil {
+			firstError = fmt.Errorf("failed iterating keysets in store: %w", err)
+		} else {
+			// Log this error too, but prioritize the error from processSingleKeyset
+			log.Printf("AutoRotator: Error iterating keysets in store: %v", err)
+		}
+	}
+
+	// Process target keyset names that weren't found by ForEachKeyset
+	for _, targetName := range ar.targetKeysetNames {
+		if _, alreadyProcessed := processedKeys[targetName]; !alreadyProcessed {
+			log.Printf("AutoRotator: Processing target keyset '%s' (not found by ForEachKeyset)...", targetName)
+			runErr := ar.processSingleKeyset(ctx, targetName)
+			if runErr != nil {
+				log.Printf("AutoRotator: Error processing target keyset '%s': %v", targetName, runErr)
+				if firstError == nil {
+					firstError = fmt.Errorf("error processing target keyset '%s': %w", targetName, runErr)
+				}
+			}
+		}
 	}
 
 	log.Println("AutoRotator: Finished rotation check cycle.")
-	return firstError // Return the first error encountered during individual processing, if any
+	return firstError // Return the first error encountered, if any
 }
 
 // processSingleKeyset handles the read, provision/rotate, and write logic for one keyset.

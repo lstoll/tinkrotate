@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	tinkrotatev1 "github.com/lstoll/tinkrotate/proto/tinkrotate/v1"
 	"github.com/tink-crypto/tink-go/v2/insecurecleartextkeyset"
@@ -23,6 +24,7 @@ type SQLStore struct {
 	db        *sql.DB
 	kek       tink.AEAD // Optional: Key-Encryption-Key for encrypting the keyset handle data
 	tableName string    // Name of the database table
+	dialect   string    // SQL dialect (e.g., "sqlite", "mysql", "postgres")
 }
 
 // SQLStoreOptions holds configuration options for SQLStore.
@@ -31,6 +33,9 @@ type SQLStoreOptions struct {
 	KEK tink.AEAD
 	// TableName specifies the name of the database table (default: "tink_keysets").
 	TableName string
+	// Dialect specifies the SQL dialect (e.g., "sqlite", "mysql", "postgres").
+	// Defaults to "sqlite" if empty.
+	Dialect string
 }
 
 // NewSQLStore creates a new SQLStore instance.
@@ -44,6 +49,7 @@ func NewSQLStore(db *sql.DB, opts *SQLStoreOptions) (*SQLStore, error) {
 	s := &SQLStore{
 		db:        db,
 		tableName: "tink_keysets", // Default table name
+		dialect:   "sqlite",       // Default dialect
 	}
 
 	if opts != nil {
@@ -52,6 +58,9 @@ func NewSQLStore(db *sql.DB, opts *SQLStoreOptions) (*SQLStore, error) {
 		}
 		if opts.KEK != nil {
 			s.kek = opts.KEK
+		}
+		if opts.Dialect != "" {
+			s.dialect = strings.ToLower(opts.Dialect)
 		}
 	}
 
@@ -66,19 +75,45 @@ func NewSQLStore(db *sql.DB, opts *SQLStoreOptions) (*SQLStore, error) {
 // Adjust types (BLOB, INTEGER) based on your specific SQL dialect.
 // The 'id' column stores the unique keysetName.
 func (s *SQLStore) Schema() string {
+	dataType := "BLOB"
+	if s.dialect == "postgres" {
+		dataType = "BYTEA"
+	}
+
+	// TODO: Consider dialect for INTEGER type as well (e.g., SERIAL for postgres auto-increment?)
+	// For now, sticking with standard INTEGER.
 	return fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s (
-    %s VARCHAR(255) PRIMARY KEY,
-    %s BLOB NOT NULL,
-    %s BLOB NOT NULL,
-    %s INTEGER NOT NULL
-);`, s.tableName, "id", "keyset_data", "metadata_data", "version")
+    id VARCHAR(255) PRIMARY KEY,
+    keyset_data %s NOT NULL,
+    metadata_data %s NOT NULL,
+    version INTEGER NOT NULL
+);`, s.tableName, dataType, dataType)
+}
+
+// rebind replaces the SQL query's parameter placeholders based on the dialect.
+// Uses '?' for most dialects and '$1', '$2', etc. for PostgreSQL.
+func rebind(dialect string, query string) string {
+	if dialect == "postgres" {
+		q := []byte(query)
+		n := 0
+		for i := 0; i < len(q); i++ {
+			if q[i] == '?' {
+				n++
+				q = append(q[:i], append([]byte(fmt.Sprintf("$%d", n)), q[i+1:]...)...)
+			}
+		}
+		return string(q)
+	}
+	// Keep '?' for other dialects (like sqlite, mysql)
+	return query
 }
 
 // ReadKeysetAndMetadata implements the ManagedStore interface.
 func (s *SQLStore) ReadKeysetAndMetadata(ctx context.Context, keysetName string) (*ReadResult, error) {
-	query := fmt.Sprintf("SELECT %s, %s, %s FROM %s WHERE %s = ?",
+	rawQuery := fmt.Sprintf("SELECT %s, %s, %s FROM %s WHERE %s = ?",
 		"keyset_data", "metadata_data", "version", s.tableName, "id")
+	query := rebind(s.dialect, rawQuery)
 
 	var keysetData, metadataData []byte
 	var version int64
@@ -176,16 +211,18 @@ func (s *SQLStore) WriteKeysetAndMetadata(ctx context.Context, keysetName string
 
 	var res sql.Result
 	if isInsert {
-		query := fmt.Sprintf("INSERT INTO %s (%s, %s, %s, %s) VALUES (?, ?, ?, ?)",
+		rawQuery := fmt.Sprintf("INSERT INTO %s (%s, %s, %s, %s) VALUES (?, ?, ?, ?)",
 			s.tableName, "id", "keyset_data", "metadata_data", "version")
+		query := rebind(s.dialect, rawQuery)
 		newVersion := int64(1)
 		res, err = tx.ExecContext(ctx, query, keysetName, keysetBuf.Bytes(), metadataData, newVersion)
 		if err != nil {
 			return fmt.Errorf("failed to insert keyset row for '%s': %w", keysetName, err)
 		}
 	} else {
-		query := fmt.Sprintf("UPDATE %s SET %s = ?, %s = ?, %s = ? WHERE %s = ? AND %s = ?",
+		rawQuery := fmt.Sprintf("UPDATE %s SET %s = ?, %s = ?, %s = ? WHERE %s = ? AND %s = ?",
 			s.tableName, "keyset_data", "metadata_data", "version", "id", "version")
+		query := rebind(s.dialect, rawQuery)
 		newVersion := expectedVersion + 1
 		res, err = tx.ExecContext(ctx, query, keysetBuf.Bytes(), metadataData, newVersion, keysetName, expectedVersion)
 		if err != nil {
@@ -241,8 +278,9 @@ func (s *SQLStore) ForEachKeyset(ctx context.Context, fn func(keysetName string)
 
 // GetCurrentHandle implements the Store interface.
 func (s *SQLStore) GetCurrentHandle(ctx context.Context, keysetName string) (*keyset.Handle, error) {
-	query := fmt.Sprintf("SELECT %s, %s FROM %s WHERE %s = ?",
+	rawQuery := fmt.Sprintf("SELECT %s, %s FROM %s WHERE %s = ?",
 		"keyset_data", "version", s.tableName, "id") // Select keyset_data and version
+	query := rebind(s.dialect, rawQuery)
 
 	var keysetData []byte
 	var version int64 // Need version for KEK associated data consistency
