@@ -22,12 +22,23 @@ var ErrKeysetExists = errors.New("keyset already exists")
 // ErrRotationPolicyMissing indicates the metadata lacks a required rotation policy.
 var ErrRotationPolicyMissing = errors.New("rotation policy missing in metadata")
 
+// AutoRotatorOpts provides optional configuration for the AutoRotator.
+type AutoRotatorOpts struct {
+	// ProvisionPolicies specifies a map of keyset names to their desired rotation
+	// policies. If a keyset name listed here does not exist in the store when
+	// RunOnce executes, the AutoRotator will attempt to provision it using the
+	// provided policy.
+	ProvisionPolicies map[string]*tinkrotatev1.RotationPolicy
+}
+
 // AutoRotator manages the lifecycle of Tink keysets within a store, performing
 // automatic rotation based on a schedule and the policies defined within each keyset's metadata.
+// It can also ensure specific keysets are provisioned if they don't exist.
 type AutoRotator struct {
-	store         ManagedStore
-	checkInterval time.Duration
-	now           func() time.Time // Allow mocking time
+	store             ManagedStore
+	checkInterval     time.Duration
+	now               func() time.Time                        // Allow mocking time
+	provisionPolicies map[string]*tinkrotatev1.RotationPolicy // Store policies to provision
 
 	// Background routine management
 	mu         sync.Mutex
@@ -40,7 +51,8 @@ type AutoRotator struct {
 // NewAutoRotator creates a new AutoRotator.
 // store: The persistence layer implementation.
 // checkInterval: How often to check if rotation is needed.
-func NewAutoRotator(store ManagedStore, checkInterval time.Duration) (*AutoRotator, error) {
+// opts: Optional configuration, including policies for keysets to provision.
+func NewAutoRotator(store ManagedStore, checkInterval time.Duration, opts *AutoRotatorOpts) (*AutoRotator, error) {
 	if store == nil {
 		return nil, errors.New("store cannot be nil")
 	}
@@ -48,11 +60,23 @@ func NewAutoRotator(store ManagedStore, checkInterval time.Duration) (*AutoRotat
 		return nil, errors.New("checkInterval must be positive")
 	}
 
+	// Validate policies within opts before creating the AutoRotator
+	provisionPolicies := make(map[string]*tinkrotatev1.RotationPolicy)
+	if opts != nil && opts.ProvisionPolicies != nil {
+		for name, policy := range opts.ProvisionPolicies {
+			if err := ValidateRotationPolicy(policy); err != nil {
+				return nil, fmt.Errorf("invalid policy provided in ProvisionPolicies for keyset '%s': %w", name, err)
+			}
+			provisionPolicies[name] = policy // Store validated policy
+		}
+	}
+
 	ar := &AutoRotator{
-		store:         store,
-		checkInterval: checkInterval,
-		now:           time.Now, // Default to real time
-		running:       false,
+		store:             store,
+		checkInterval:     checkInterval,
+		now:               time.Now,          // Default to real time
+		provisionPolicies: provisionPolicies, // Assign validated map
+		running:           false,
 	}
 
 	return ar, nil
@@ -62,18 +86,23 @@ func NewAutoRotator(store ManagedStore, checkInterval time.Duration) (*AutoRotat
 // It iterates through each keyset name provided by store.ForEachKeyset.
 // It reads each keyset, applies the rotation logic defined in its *own* metadata,
 // and writes back if changes occurred.
-// It does NOT automatically provision keysets.
+// After processing existing keysets, it checks the keys specified in ProvisionPolicies
+// (from opts) and attempts to provision any that do not exist in the store.
 func (ar *AutoRotator) RunOnce(ctx context.Context) error {
-	log.Println("AutoRotator: Starting rotation check cycle for all existing keysets...")
+	log.Println("AutoRotator: Starting rotation check cycle...")
 	var firstError error
+	processedKeys := make(map[string]struct{}) // Track keys processed by ForEachKeyset
 
-	// Process keys found in the store
+	// 1. Process existing keys found in the store
+	log.Println("AutoRotator: Processing existing keysets found in store...")
 	err := ar.store.ForEachKeyset(ctx, func(keysetName string) error {
-		log.Printf("AutoRotator: Processing existing keyset '%s' found via ForEachKeyset...", keysetName)
+		log.Printf("AutoRotator: Processing existing keyset '%s'...", keysetName)
+		processedKeys[keysetName] = struct{}{} // Mark as processed
 		runErr := ar.processSingleKeyset(ctx, keysetName)
 		if runErr != nil {
 			log.Printf("AutoRotator: Error processing keyset '%s': %v", keysetName, runErr)
 			if firstError == nil {
+				// Capture the first error encountered during rotation of existing keys
 				firstError = fmt.Errorf("error processing keyset '%s': %w", keysetName, runErr)
 			}
 		}
@@ -87,6 +116,48 @@ func (ar *AutoRotator) RunOnce(ctx context.Context) error {
 		} else {
 			// Log this error too, but prioritize the error from processSingleKeyset
 			log.Printf("AutoRotator: Error iterating keysets in store: %v", err)
+		}
+	}
+
+	// 2. Process keys specified for provisioning if they weren't already processed
+	if len(ar.provisionPolicies) > 0 {
+		log.Println("AutoRotator: Checking specified keysets for provisioning...")
+		for keysetName, policy := range ar.provisionPolicies {
+			if _, alreadyProcessed := processedKeys[keysetName]; alreadyProcessed {
+				log.Printf("AutoRotator: Keyset '%s' already processed, skipping provisioning check.", keysetName)
+				continue
+			}
+
+			log.Printf("AutoRotator: Checking existence of specified keyset '%s' for potential provisioning...", keysetName)
+			// Check if it exists now. We expect ErrKeysetNotFound if we need to provision.
+			_, readErr := ar.store.ReadKeysetAndMetadata(ctx, keysetName)
+
+			if readErr == nil {
+				// Keyset exists unexpectedly (ForEachKeyset might be inconsistent or timing issue)
+				log.Printf("AutoRotator: Specified keyset '%s' found unexpectedly, skipping provisioning.", keysetName)
+				continue
+			}
+
+			if errors.Is(readErr, ErrKeysetNotFound) {
+				// Keyset does not exist, attempt to provision it
+				log.Printf("AutoRotator: Attempting to provision specified keyset '%s'...", keysetName)
+				provisionErr := ar.ProvisionKeyset(ctx, keysetName, policy)
+				if provisionErr != nil {
+					log.Printf("AutoRotator: Failed to provision specified keyset '%s': %v", keysetName, provisionErr)
+					if firstError == nil {
+						// Capture the first provisioning error
+						firstError = fmt.Errorf("failed to provision specified keyset '%s': %w", keysetName, provisionErr)
+					}
+				} else {
+					log.Printf("AutoRotator: Successfully provisioned specified keyset '%s'.", keysetName)
+				}
+			} else {
+				// Another error occurred trying to read the keyset
+				log.Printf("AutoRotator: Error checking existence of specified keyset '%s' for provisioning: %v", keysetName, readErr)
+				if firstError == nil {
+					firstError = fmt.Errorf("error checking existence of specified keyset '%s': %w", keysetName, readErr)
+				}
+			}
 		}
 	}
 
