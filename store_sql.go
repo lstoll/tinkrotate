@@ -255,7 +255,7 @@ func (s *SQLStore) ForEachKeyset(ctx context.Context, fn func(keysetName string)
 	if err != nil {
 		return fmt.Errorf("failed to query distinct keyset names: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var keysetNames []string
 

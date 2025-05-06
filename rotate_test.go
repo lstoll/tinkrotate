@@ -234,13 +234,6 @@ func assertNotZero[T ~int | ~float64 | ~uint32](t testing.TB, v T, msg string, a
 	}
 }
 
-func assertTrue[T ~bool](t testing.TB, v T, msg string, args ...any) {
-	t.Helper()
-	if !v {
-		t.Fatalf("should be true, but was: %s", fmt.Sprintf(msg, args...))
-	}
-}
-
 func requireNoError(t testing.TB, err error, msg string, args ...any) {
 	t.Helper()
 	if err != nil {
@@ -259,13 +252,6 @@ func assertNotEqual[T comparable](t testing.TB, a, b T, msg string, args ...any)
 	t.Helper()
 	if a == b {
 		t.Fatalf("should be not equal, but was: %v. %s", b, fmt.Sprintf(msg, args...))
-	}
-}
-
-func requireNotZero[T ~int | ~float64 | ~uint32](t testing.TB, v T, msg string, args ...any) {
-	t.Helper()
-	if v == 0 {
-		t.Fatalf("should be not zero, but was: %s", fmt.Sprintf(msg, args...))
 	}
 }
 
