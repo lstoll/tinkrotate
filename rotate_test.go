@@ -138,7 +138,11 @@ func TestRotatorEndToEnd(t *testing.T) {
 		}
 
 		// 3. Run rotator function (using the current time *before* advancing it)
-		newHandle, newMetadata, err := RotateKeyset(currentTime, handle, metadata)
+		newHandle, newMetadata, err := RotateKeyset(handle, metadata, &RotateOpts{
+			TimeSource: func() time.Time {
+				return currentTime
+			},
+		})
 		requireNoError(t, err, "[%s] RotateKeyset failed", simTime) // Check error at current time
 
 		// Update handle and metadata for the next iteration

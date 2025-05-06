@@ -3,6 +3,8 @@ package tinkrotate
 import (
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"sort"
 	"time"
 
@@ -38,6 +40,11 @@ func ValidateRotationPolicy(policy *tinkrotatev1.RotationPolicy) error {
 	return nil
 }
 
+type RotateOpts struct {
+	TimeSource func() time.Time
+	Logger     *slog.Logger
+}
+
 // RotateKeyset performs one rotation cycle based on the provided current time.
 // It reads the rotation policy *from the metadata* itself.
 // It takes the current keyset handle and its corresponding metadata,
@@ -45,10 +52,19 @@ func ValidateRotationPolicy(policy *tinkrotatev1.RotationPolicy) error {
 // keyset handle and updated metadata.
 // The caller is responsible for persisting the returned handle and metadata.
 func RotateKeyset(
-	currentTime time.Time, // Use explicit time
 	handle *keyset.Handle,
 	metadata *tinkrotatev1.KeyRotationMetadata,
+	opts *RotateOpts,
 ) (*keyset.Handle, *tinkrotatev1.KeyRotationMetadata, error) {
+
+	// --- Setup Logger ---
+	var logger *slog.Logger
+	if opts != nil && opts.Logger != nil {
+		logger = opts.Logger
+	} else {
+		logger = slog.New(slog.DiscardHandler)
+	}
+	logger = logger.With("function", "RotateKeyset")
 
 	// --- Validate Inputs ---
 	if handle == nil {
@@ -70,6 +86,11 @@ func RotateKeyset(
 	policy := metadata.RotationPolicy
 	if err := ValidateRotationPolicy(policy); err != nil {
 		return nil, nil, fmt.Errorf("invalid rotation policy in metadata: %w", err)
+	}
+
+	currentTime := time.Now()
+	if opts != nil && opts.TimeSource != nil {
+		currentTime = opts.TimeSource()
 	}
 
 	// --- Policy Durations (extracted for readability) ---
@@ -103,20 +124,20 @@ func RotateKeyset(
 		meta, metaExists := metadata.KeyMetadata[keyID]
 
 		if !metaExists {
-			fmt.Printf("[RotateKeyset Warning] Key ID %d found in keyset but not in metadata. Skipping.\n", keyID)
+			logger.Warn("Key ID found in keyset but not in metadata. Skipping.", "keyID", keyID)
 			continue
 		}
 
 		currentState := meta.State
 		currentStatus := keyInfo.GetStatus()
 		if currentState == tinkrotatev1.KeyState_KEY_STATE_PRIMARY && currentStatus != tinkpb.KeyStatusType_ENABLED && keyInfo.GetOutputPrefixType() != tinkpb.OutputPrefixType_RAW { // Primary must be enabled (unless RAW key) - Tink enforces this via SetPrimary
-			fmt.Printf("[RotateKeyset Warning] Key ID %d metadata state is PRIMARY, but Tink status is %s.\n", keyID, currentStatus)
+			logger.Warn("Key metadata state is PRIMARY, but Tink status is different.", "keyID", keyID, "tink_status", currentStatus)
 		}
 		if (currentState == tinkrotatev1.KeyState_KEY_STATE_PENDING || currentState == tinkrotatev1.KeyState_KEY_STATE_PHASING_OUT) && currentStatus != tinkpb.KeyStatusType_ENABLED {
-			fmt.Printf("[RotateKeyset Warning] Key ID %d metadata state is %s, but Tink status is %s. Should be ENABLED.\n", keyID, currentState, currentStatus)
+			logger.Warn("Key metadata state requires ENABLED Tink status, but found different.", "keyID", keyID, "metadata_state", currentState, "tink_status", currentStatus)
 		}
 		if currentState == tinkrotatev1.KeyState_KEY_STATE_DISABLED && currentStatus != tinkpb.KeyStatusType_DISABLED {
-			fmt.Printf("[RotateKeyset Warning] Key ID %d metadata state is DISABLED, but Tink status is %s. Should be DISABLED.\n", keyID, currentStatus)
+			logger.Warn("Key metadata state is DISABLED, but Tink status is different.", "keyID", keyID, "tink_status", currentStatus)
 		}
 
 		ki := &KeyInfo{
@@ -129,7 +150,7 @@ func RotateKeyset(
 		switch meta.State {
 		case tinkrotatev1.KeyState_KEY_STATE_PRIMARY:
 			if primaryKey != nil {
-				fmt.Printf("[RotateKeyset Warning] Multiple keys (%d, %d) marked as PRIMARY in metadata. Using first encountered (%d).\n", primaryKey.KeyID, ki.KeyID, primaryKey.KeyID)
+				logger.Warn("Multiple keys marked as PRIMARY in metadata. Using first encountered.", "existing_primary_key_id", primaryKey.KeyID, "new_primary_key_id", ki.KeyID, "using_key_id", primaryKey.KeyID)
 			} else {
 				primaryKey = ki
 			}
@@ -158,22 +179,22 @@ func RotateKeyset(
 	keysToDelete := []uint32{}
 	for _, ki := range disabledKeys {
 		if ki.Metadata == nil || ki.Metadata.DeletionTime == nil {
-			fmt.Printf("[RotateKeyset Warning] Disabled key %d missing metadata or deletion time. Skipping deletion check.\n", ki.KeyID)
+			logger.Warn("Disabled key missing metadata or deletion time. Skipping deletion check.", "keyID", ki.KeyID)
 			continue
 		}
 
 		if !currentTime.Before(ki.Metadata.DeletionTime.AsTime()) {
 			tinkKeyInfo, err := findTinkKeyInfo(manager, ki.KeyID)
 			if err != nil {
-				fmt.Printf("[RotateKeyset Warning] Could not find Tink info for key %d during deletion check: %v. Skipping.\n", ki.KeyID, err)
+				logger.Warn("Could not find Tink info for key during deletion check. Skipping.", "keyID", ki.KeyID, "error", err)
 				continue
 			}
 
 			if tinkKeyInfo.GetStatus() != tinkpb.KeyStatusType_DESTROYED {
-				fmt.Printf("[RotateKeyset Info] Deleting key %d (past deletion time %s).\n", ki.KeyID, ki.Metadata.DeletionTime.AsTime().Format(time.RFC3339))
+				logger.Info("Deleting key (past deletion time).", "keyID", ki.KeyID, "deletion_time", ki.Metadata.DeletionTime.AsTime().Format(time.RFC3339))
 				err := manager.Delete(ki.KeyID)
 				if err != nil {
-					fmt.Printf("[RotateKeyset Error] Failed to delete key %d: %v\n", ki.KeyID, err)
+					logger.Error("Failed to delete key.", "keyID", ki.KeyID, "error", err)
 				} else {
 					keysToDelete = append(keysToDelete, ki.KeyID) // Mark for metadata removal
 					updated = true
@@ -193,7 +214,7 @@ func RotateKeyset(
 	// --- 2. Process Disabling (Phasing-Out -> Disabled) ---
 	for _, ki := range phasingOutKeys {
 		if ki.Metadata == nil {
-			fmt.Printf("[RotateKeyset Warning] Phasing-out key %d missing metadata. Skipping disable check.\n", ki.KeyID)
+			logger.Warn("Phasing-out key missing metadata. Skipping disable check.", "keyID", ki.KeyID)
 			continue
 		}
 
@@ -207,24 +228,24 @@ func RotateKeyset(
 			if ki.Metadata.CreationTime != nil {
 				expectedDisableTime = ki.Metadata.CreationTime.AsTime().Add(primaryDuration).Add(phaseOutDuration)
 				disableTimeKnown = true
-				fmt.Printf("[RotateKeyset Info] Key %d using fallback disable time check.\n", ki.KeyID)
+				logger.Info("Key using fallback disable time check.", "keyID", ki.KeyID)
 			} else {
-				fmt.Printf("[RotateKeyset Warning] Phasing-out key %d missing creation time. Cannot determine disable time. Skipping.\n", ki.KeyID)
+				logger.Warn("Phasing-out key missing creation time. Cannot determine disable time. Skipping.", "keyID", ki.KeyID)
 			}
 		}
 
 		if disableTimeKnown && !currentTime.Before(expectedDisableTime) {
 			tinkKeyInfo, err := findTinkKeyInfo(manager, ki.KeyID)
 			if err != nil {
-				fmt.Printf("[RotateKeyset Warning] Could not find Tink info for key %d during disable check: %v. Skipping.\n", ki.KeyID, err)
+				logger.Warn("Could not find Tink info for key during disable check. Skipping.", "keyID", ki.KeyID, "error", err)
 				continue
 			}
 
 			if tinkKeyInfo.GetStatus() == tinkpb.KeyStatusType_ENABLED {
-				fmt.Printf("[RotateKeyset Info] Disabling key %d (phase-out period ended at %s).\n", ki.KeyID, expectedDisableTime.Format(time.RFC3339))
+				logger.Info("Disabling key (phase-out period ended).", "keyID", ki.KeyID, "expected_disable_time", expectedDisableTime.Format(time.RFC3339))
 				err := manager.Disable(ki.KeyID)
 				if err != nil {
-					fmt.Printf("[RotateKeyset Error] Failed to disable key %d: %v\n", ki.KeyID, err)
+					logger.Error("Failed to disable key.", "keyID", ki.KeyID, "error", err)
 					continue // Skip metadata update on error
 				}
 				ki.Metadata.State = tinkrotatev1.KeyState_KEY_STATE_DISABLED
@@ -232,7 +253,7 @@ func RotateKeyset(
 				ki.Metadata.DeletionTime = timestamppb.New(currentTime.Add(deletionGracePeriod))
 				updated = true
 			} else if tinkKeyInfo.GetStatus() == tinkpb.KeyStatusType_DISABLED && ki.Metadata.State != tinkrotatev1.KeyState_KEY_STATE_DISABLED {
-				fmt.Printf("[RotateKeyset Info] Aligning metadata for already disabled key %d.\n", ki.KeyID)
+				logger.Info("Aligning metadata for already disabled key.", "keyID", ki.KeyID)
 				ki.Metadata.State = tinkrotatev1.KeyState_KEY_STATE_DISABLED
 				if ki.Metadata.DisableTime == nil {
 					ki.Metadata.DisableTime = timestamppb.New(currentTime)
@@ -250,7 +271,7 @@ func RotateKeyset(
 	// --- 3. Process Promotion (Pending -> Primary) ---
 	if primaryKey != nil {
 		if primaryKey.Metadata == nil {
-			fmt.Printf("[RotateKeyset Warning] Primary key %d missing metadata. Skipping promotion check.\n", primaryKey.KeyID)
+			logger.Warn("Primary key missing metadata. Skipping promotion check.", "keyID", primaryKey.KeyID)
 		} else {
 			primaryExpired := false
 			expiryTimeKnown := false
@@ -261,9 +282,9 @@ func RotateKeyset(
 			} else if primaryKey.Metadata.CreationTime != nil {
 				expectedEndTime = primaryKey.Metadata.CreationTime.AsTime().Add(primaryDuration)
 				expiryTimeKnown = true
-				fmt.Printf("[RotateKeyset Warning] Primary key %d missing promotion time. Using creation time for expiry check.\n", primaryKey.KeyID)
+				logger.Warn("Primary key missing promotion time. Using creation time for expiry check.", "keyID", primaryKey.KeyID)
 			} else {
-				fmt.Printf("[RotateKeyset Warning] Primary key %d missing both promotion and creation time. Cannot check expiry.\n", primaryKey.KeyID)
+				logger.Warn("Primary key missing both promotion and creation time. Cannot check expiry.", "keyID", primaryKey.KeyID)
 			}
 
 			if expiryTimeKnown && !currentTime.Before(expectedEndTime) {
@@ -275,26 +296,26 @@ func RotateKeyset(
 					promoted := false
 					for _, pendingKey := range pendingKeys {
 						if pendingKey.Metadata == nil || pendingKey.Metadata.CreationTime == nil {
-							fmt.Printf("[RotateKeyset Warning] Pending key %d missing metadata or creation time. Skipping promotion check for this key.\n", pendingKey.KeyID)
+							logger.Warn("Pending key missing metadata or creation time. Skipping promotion check for this key.", "keyID", pendingKey.KeyID)
 							continue
 						}
 
 						tinkKeyInfo, err := findTinkKeyInfo(manager, pendingKey.KeyID)
 						if err != nil {
-							fmt.Printf("[RotateKeyset Warning] Could not find Tink info for pending key %d during promotion check: %v. Skipping.\n", pendingKey.KeyID, err)
+							logger.Warn("Could not find Tink info for pending key during promotion check. Skipping.", "keyID", pendingKey.KeyID, "error", err)
 							continue
 						}
 						if tinkKeyInfo.GetStatus() != tinkpb.KeyStatusType_ENABLED {
-							fmt.Printf("[RotateKeyset Warning] Pending key %d is not ENABLED in keyset (status: %s). Skipping promotion.\n", pendingKey.KeyID, tinkKeyInfo.GetStatus())
+							logger.Warn("Pending key is not ENABLED in keyset. Skipping promotion.", "keyID", pendingKey.KeyID, "tink_status", tinkKeyInfo.GetStatus())
 							continue
 						}
 
 						propagationEndTime := pendingKey.Metadata.CreationTime.AsTime().Add(propagationTime)
 						if !currentTime.Before(propagationEndTime) {
-							fmt.Printf("[RotateKeyset Info] Promoting key %d to PRIMARY (Primary %d expired at %s, propagation time met).\n", pendingKey.KeyID, primaryKey.KeyID, expectedEndTime.Format(time.RFC3339))
+							logger.Info("Promoting key to PRIMARY (Primary expired, propagation time met).", "pending_key_id", pendingKey.KeyID, "primary_key_id", primaryKey.KeyID, "primary_expiry_time", expectedEndTime.Format(time.RFC3339))
 							err := manager.SetPrimary(pendingKey.KeyID)
 							if err != nil {
-								fmt.Printf("[RotateKeyset Error] Failed to promote key %d: %v\n", pendingKey.KeyID, err)
+								logger.Error("Failed to promote key.", "keyID", pendingKey.KeyID, "error", err)
 								continue
 							}
 
@@ -307,18 +328,18 @@ func RotateKeyset(
 							promoted = true
 							break // Promotion successful
 						} else {
-							fmt.Printf("[RotateKeyset Info] Primary key %d expired, but pending key %d hasn't met propagation time (%s remaining until %s). Waiting.\n",
-								primaryKey.KeyID, pendingKey.KeyID, propagationEndTime.Sub(currentTime).Round(time.Second), propagationEndTime.Format(time.RFC3339))
+							logger.Info("Primary key expired, but pending key hasn't met propagation time. Waiting.",
+								"primary_key_id", primaryKey.KeyID, "pending_key_id", pendingKey.KeyID, "propagation_time_remaining", propagationEndTime.Sub(currentTime).Round(time.Second), "propagation_end_time", propagationEndTime.Format(time.RFC3339))
 							break // Block promotion, wait for next cycle
 						}
 					}
 					if !promoted && len(pendingKeys) > 0 {
-						fmt.Printf("[RotateKeyset Info] Primary key %d expired, but no suitable pending key ready for promotion yet.\n", primaryKey.KeyID)
+						logger.Info("Primary key expired, but no suitable pending key ready for promotion yet.", "primary_key_id", primaryKey.KeyID)
 					} else if len(pendingKeys) == 0 {
-						fmt.Printf("[RotateKeyset Warning] Primary key %d expired, but NO PENDING key available to promote.\n", primaryKey.KeyID)
+						logger.Warn("Primary key expired, but NO PENDING key available to promote.", "keyID", primaryKey.KeyID)
 					}
 				} else {
-					fmt.Printf("[RotateKeyset Warning] Primary key %d expired, but NO PENDING key available to promote.\n", primaryKey.KeyID)
+					logger.Warn("Primary key expired, but NO PENDING key available to promote.", "keyID", primaryKey.KeyID)
 				}
 			}
 		}
@@ -326,33 +347,33 @@ func RotateKeyset(
 		if len(pendingKeys) > 0 {
 			pendingKey := pendingKeys[0] // Oldest one
 			if pendingKey.Metadata == nil || pendingKey.Metadata.CreationTime == nil {
-				fmt.Printf("[RotateKeyset Warning] Pending key %d missing metadata or creation time. Cannot promote.\n", pendingKey.KeyID)
+				logger.Warn("Pending key missing metadata or creation time. Cannot promote.", "keyID", pendingKey.KeyID)
 			} else {
 				tinkKeyInfo, err := findTinkKeyInfo(manager, pendingKey.KeyID)
 				if err != nil {
-					fmt.Printf("[RotateKeyset Warning] Could not find Tink info for pending key %d during initial promotion check: %v. Skipping.\n", pendingKey.KeyID, err)
+					logger.Warn("Could not find Tink info for pending key during initial promotion check. Skipping.", "keyID", pendingKey.KeyID, "error", err)
 				} else if tinkKeyInfo.GetStatus() != tinkpb.KeyStatusType_ENABLED {
-					fmt.Printf("[RotateKeyset Warning] Pending key %d is not ENABLED (status: %s). Cannot promote.\n", pendingKey.KeyID, tinkKeyInfo.GetStatus())
+					logger.Warn("Pending key is not ENABLED. Cannot promote.", "keyID", pendingKey.KeyID, "tink_status", tinkKeyInfo.GetStatus())
 				} else {
 					propagationEndTime := pendingKey.Metadata.CreationTime.AsTime().Add(propagationTime)
 					if !currentTime.Before(propagationEndTime) {
-						fmt.Printf("[RotateKeyset Info] Promoting key %d to PRIMARY (no primary exists, propagation time met).\n", pendingKey.KeyID)
+						logger.Info("Promoting key to PRIMARY (no primary exists, propagation time met).", "keyID", pendingKey.KeyID)
 						err := manager.SetPrimary(pendingKey.KeyID)
 						if err != nil {
-							fmt.Printf("[RotateKeyset Error] Failed to promote key %d: %v\n", pendingKey.KeyID, err)
+							logger.Error("Failed to promote key.", "keyID", pendingKey.KeyID, "error", err)
 						} else {
 							pendingKey.Metadata.State = tinkrotatev1.KeyState_KEY_STATE_PRIMARY
 							pendingKey.Metadata.PromotionTime = timestamppb.New(currentTime)
 							updated = true
 						}
 					} else {
-						fmt.Printf("[RotateKeyset Info] No primary key, pending key %d not ready for promotion (%s remaining until %s).\n",
-							pendingKey.KeyID, propagationEndTime.Sub(currentTime).Round(time.Second), propagationEndTime.Format(time.RFC3339))
+						logger.Info("No primary key, pending key not ready for promotion.",
+							"pending_key_id", pendingKey.KeyID, "propagation_time_remaining", propagationEndTime.Sub(currentTime).Round(time.Second), "propagation_end_time", propagationEndTime.Format(time.RFC3339))
 					}
 				}
 			}
 		} else {
-			fmt.Println("[RotateKeyset Info] No primary key and no pending keys found.")
+			logger.Info("No primary key and no pending keys found.")
 		}
 	}
 
@@ -397,7 +418,7 @@ func RotateKeyset(
 				}
 			} else {
 				// Metadata says primary, but Tink disagrees. Correct metadata.
-				fmt.Printf("[RotateKeyset Warning] Metadata state for key %d is PRIMARY, but Tink primary is %d. Setting state to PHASING_OUT.\n", keyInfo.GetKeyId(), ksInfo.GetPrimaryKeyId())
+				logger.Warn("Metadata state for key is PRIMARY, but Tink primary is different. Setting state to PHASING_OUT.", "keyID", keyInfo.GetKeyId(), "tink_primary_id", ksInfo.GetPrimaryKeyId())
 				meta.State = tinkrotatev1.KeyState_KEY_STATE_PHASING_OUT
 				meta.PromotionTime = nil // Clear promotion time
 				updated = true
@@ -413,7 +434,7 @@ func RotateKeyset(
 		meta, exists := metadata.KeyMetadata[tinkPrimaryId]
 		if exists {
 			if meta.State != tinkrotatev1.KeyState_KEY_STATE_PRIMARY {
-				fmt.Printf("[RotateKeyset Warning] Tink primary is %d, but its metadata state was %s. Setting metadata state to PRIMARY.\n", tinkPrimaryId, meta.State)
+				logger.Warn("Tink primary key's metadata state was not PRIMARY. Setting metadata state to PRIMARY.", "tink_primary_id", tinkPrimaryId, "previous_metadata_state", meta.State)
 				meta.State = tinkrotatev1.KeyState_KEY_STATE_PRIMARY
 				if meta.PromotionTime == nil { // Set promotion time if missing
 					meta.PromotionTime = timestamppb.New(currentTime)
@@ -423,14 +444,14 @@ func RotateKeyset(
 			}
 			// If state was already primary, primaryKey should have been set unless keyInfos map was incomplete
 		} else {
-			fmt.Printf("[RotateKeyset Error] Tink primary key %d has no corresponding metadata!\n", tinkPrimaryId)
+			logger.Error("Tink primary key has no corresponding metadata!", "tink_primary_id", tinkPrimaryId)
 			// This is a critical inconsistency, potentially halt? For now, we logged the error.
 		}
 	}
 
 	// --- 4. Generate New Pending Key ---
 	if primaryKey != nil && !hasPending {
-		fmt.Printf("[RotateKeyset Info] Generating new PENDING key (Primary %d exists, no pending key found).\n", primaryKey.KeyID)
+		logger.Info("Generating new PENDING key (Primary exists, no pending key found).", "primary_key_id", primaryKey.KeyID)
 		keyID, err := manager.Add(keyTemplate)
 		if err != nil {
 			// Error adding key, return previous state and error
@@ -443,7 +464,7 @@ func RotateKeyset(
 		}
 		metadata.KeyMetadata[keyID] = newMeta
 		updated = true
-		fmt.Printf("[RotateKeyset Info] Generated new PENDING key %d.\n", keyID)
+		logger.Info("Generated new PENDING key.", "keyID", keyID)
 	}
 
 	// --- Return updated handle and metadata ---
@@ -461,7 +482,7 @@ func RotateKeyset(
 	// Final consistency check before returning?
 	finalInconsistencies := CheckConsistency(finalHandle, metadata)
 	if len(finalInconsistencies) > 0 {
-		fmt.Printf("[RotateKeyset Warning] Inconsistencies found *after* rotation attempt: %v. Returning potentially inconsistent state.\n", finalInconsistencies)
+		logger.Warn("Inconsistencies found *after* rotation attempt. Returning potentially inconsistent state.", "inconsistencies", finalInconsistencies)
 		// Decide: return error, or return the state anyway? Returning state for now.
 	}
 
@@ -493,6 +514,10 @@ type KeyInfo struct {
 // It needs to handle the new structure of KeyRotationMetadata.
 func CheckConsistency(handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationMetadata) []error {
 	var inconsistencies []error
+
+	// Create a default logger for CheckConsistency, as it doesn't have RotateOpts
+	// This could be passed in if CheckConsistency is used in other contexts needing specific logging.
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil)).With("function", "CheckConsistency")
 
 	if handle == nil {
 		inconsistencies = append(inconsistencies, errors.New("keyset handle is nil"))
@@ -628,7 +653,9 @@ func CheckConsistency(handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationM
 			if tinkStatus != tinkpb.KeyStatusType_DISABLED {
 				// Allow ENABLED/UNKNOWN only if RAW key? No, Tink disables non-raw keys too.
 				// If it's ENABLED, that's a definite mismatch. If DESTROYED, it shouldn't be in tinkKeyIDs.
-				inconsistencies = append(inconsistencies, fmt.Errorf("key ID %d: metadata state is DISABLED, but Tink status is %s (expected DISABLED)", kID, tinkStatus))
+				if tinkStatus != tinkpb.KeyStatusType_DESTROYED {
+					inconsistencies = append(inconsistencies, fmt.Errorf("key ID %d: metadata state is DISABLED, but Tink status is %s (expected DISABLED or DESTROYED)", kID, tinkStatus))
+				}
 			}
 		case tinkrotatev1.KeyState_KEY_STATE_UNSPECIFIED:
 			inconsistencies = append(inconsistencies, fmt.Errorf("key ID %d: metadata state is UNSPECIFIED", kID))
@@ -645,10 +672,16 @@ func CheckConsistency(handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationM
 				inconsistencies = append(inconsistencies, fmt.Errorf("key ID %d: Tink status is DISABLED, but metadata state is %s (expected DISABLED)", kID, metaState))
 			}
 		case tinkpb.KeyStatusType_DESTROYED:
-			// This case shouldn't be reachable as destroyed keys shouldn't be in tinkKeyIDs
-			inconsistencies = append(inconsistencies, fmt.Errorf("key ID %d: Found in Tink KeyInfo with status DESTROYED (should have been filtered)", kID))
+			// This case means the key is in KeysetInfo but marked as DESTROYED.
+			// Metadata should ideally reflect this by being in DISABLED state and due for removal, or already removed.
+			// If metadata still exists and isn't DISABLED, it's an inconsistency.
+			if metaState != tinkrotatev1.KeyState_KEY_STATE_DISABLED {
+				inconsistencies = append(inconsistencies, fmt.Errorf("key ID %d: Tink status is DESTROYED, but metadata state is %s (expected DISABLED or metadata to be removed)", kID, metaState))
+			}
+			// If key is DESTROYED, it might be fine for metadata to be KEY_STATE_DISABLED.
+			// The key will be removed from metadata by the deletion logic in RotateKeyset.
 		case tinkpb.KeyStatusType_UNKNOWN_STATUS:
-			// Handle unknown status? Maybe just log it.
+			logger.Warn("Key found with UNKNOWN_STATUS in Tink.", "keyID", kID)
 		}
 	}
 

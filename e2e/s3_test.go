@@ -75,5 +75,5 @@ func TestAutoRotator_S3_BlackBox(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create S3 store: %v", err)
 	}
-	runStoreTest(t, store, keysetName)
+	runStoreTest(t, store)
 }

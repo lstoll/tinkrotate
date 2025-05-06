@@ -13,4 +13,4 @@ export MINIO_SECRET_KEY
 export TINKROTATE_POSTGRES_URL
 export TINKROTATE_MYSQL_URL
 
-go test .
+go test . "$@"

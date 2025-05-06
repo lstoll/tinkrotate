@@ -13,8 +13,6 @@ import (
 )
 
 func TestAutoRotator_SQLite_BlackBox(t *testing.T) {
-	keysetID := "test-keyset-autorotator" // ID for the keyset in the DB
-
 	// --- Database Setup ---
 	// Using ":memory:" for a private in-memory database per test run
 	// Use cache=shared to ensure all connections see the same in-memory DB
@@ -32,7 +30,7 @@ func TestAutoRotator_SQLite_BlackBox(t *testing.T) {
 	require.NoError(t, err, "Failed to create database schema")
 
 	// Call the central runStoreTest function from store_test.go
-	runStoreTest(t, sqlStore, keysetID)
+	runStoreTest(t, sqlStore)
 }
 
 func TestAutoRotator_MySQL_BlackBox(t *testing.T) {
@@ -40,8 +38,6 @@ func TestAutoRotator_MySQL_BlackBox(t *testing.T) {
 	if mysqlURL == "" {
 		t.Skip("TINKROTATE_MYSQL_URL not set, skipping MySQL test")
 	}
-
-	keysetID := "test-keyset-autorotator-mysql" // ID for the keyset in the DB
 
 	// --- Database Setup ---
 	db, err := sql.Open("mysql", mysqlURL)
@@ -57,7 +53,7 @@ func TestAutoRotator_MySQL_BlackBox(t *testing.T) {
 	require.NoError(t, err, "Failed to create database schema")
 
 	// Call the central runStoreTest function
-	runStoreTest(t, sqlStore, keysetID)
+	runStoreTest(t, sqlStore)
 }
 
 func TestAutoRotator_Postgres_BlackBox(t *testing.T) {
@@ -65,8 +61,6 @@ func TestAutoRotator_Postgres_BlackBox(t *testing.T) {
 	if postgresURL == "" {
 		t.Skip("TINKROTATE_POSTGRES_URL not set, skipping PostgreSQL test")
 	}
-
-	keysetID := "test-keyset-autorotator-postgres" // ID for the keyset in the DB
 
 	// --- Database Setup ---
 	db, err := sql.Open("pgx", postgresURL) // Use "pgx" driver name
@@ -82,5 +76,5 @@ func TestAutoRotator_Postgres_BlackBox(t *testing.T) {
 	require.NoError(t, err, "Failed to create database schema")
 
 	// Call the central runStoreTest function
-	runStoreTest(t, sqlStore, keysetID)
+	runStoreTest(t, sqlStore)
 }

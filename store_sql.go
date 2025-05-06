@@ -246,7 +246,8 @@ func (s *SQLStore) WriteKeysetAndMetadata(ctx context.Context, keysetName string
 	return nil
 }
 
-// ForEachKeyset implements the ManagedStore interface.
+// ForEachKeyset implements the ManagedStore interface. It does not perform any
+// paging, all rows are retrieved and iterated over at once.
 func (s *SQLStore) ForEachKeyset(ctx context.Context, fn func(keysetName string) error) error {
 	query := fmt.Sprintf("SELECT DISTINCT %s FROM %s", "id", s.tableName)
 
@@ -256,21 +257,26 @@ func (s *SQLStore) ForEachKeyset(ctx context.Context, fn func(keysetName string)
 	}
 	defer rows.Close()
 
+	var keysetNames []string
+
 	for rows.Next() {
 		var keysetName string
 		if err := rows.Scan(&keysetName); err != nil {
 			return fmt.Errorf("failed to scan keyset name: %w", err)
 		}
+		keysetNames = append(keysetNames, keysetName)
+	}
+	_ = rows.Close()
+	if err := rows.Err(); err != nil {
+		// Check for errors during iteration
+		return fmt.Errorf("error during keyset name iteration: %w", err)
+	}
 
+	for _, keysetName := range keysetNames {
 		if err := fn(keysetName); err != nil {
 			// If the callback function returns an error, stop iteration and return it.
 			return fmt.Errorf("callback function failed for keyset '%s': %w", keysetName, err)
 		}
-	}
-
-	if err := rows.Err(); err != nil {
-		// Check for errors during iteration
-		return fmt.Errorf("error during keyset name iteration: %w", err)
 	}
 
 	return nil

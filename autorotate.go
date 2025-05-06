@@ -33,6 +33,9 @@ type AutoRotatorOpts struct {
 	// Logger allows providing a custom slog logger. If nil, a default logger
 	// with the attribute "component"="autorotator" will be used.
 	Logger *slog.Logger
+
+	// TimeSource allows providing a custom time source. If nil, time.Now is used.
+	TimeSource func() time.Time
 }
 
 // AutoRotator manages the lifecycle of Tink keysets within a store, performing
@@ -94,6 +97,10 @@ func NewAutoRotator(store ManagedStore, checkInterval time.Duration, opts *AutoR
 		provisionPolicies: provisionPolicies, // Assign validated map
 		running:           false,
 		logger:            logger, // Assign the logger
+	}
+
+	if opts != nil && opts.TimeSource != nil {
+		ar.now = opts.TimeSource
 	}
 
 	return ar, nil
@@ -231,8 +238,12 @@ func (ar *AutoRotator) processSingleKeyset(ctx context.Context, keysetName strin
 
 	// --- Perform Rotation Logic using the standalone function ---
 	// Use the AutoRotator's time source
-	currentTime := ar.now()
-	newHandle, newMetadata, rotationErr := RotateKeyset(currentTime, currentHandle, currentMetadata)
+	newHandle, newMetadata, rotationErr := RotateKeyset(currentHandle, currentMetadata, &RotateOpts{
+		TimeSource: func() time.Time {
+			return ar.now()
+		},
+		Logger: ar.logger.With("keyset_name", keysetName),
+	})
 
 	if rotationErr != nil {
 		// Log the error but return it, allowing RunOnce to continue with other keysets
@@ -413,6 +424,16 @@ func (ar *AutoRotator) ProvisionKeyset(ctx context.Context, keysetName string, p
 				PromotionTime: timestamppb.New(now), // Primary on creation
 			},
 		},
+	}
+
+	// Run a rotate to ensure pending keys are provisioned
+	handle, metadata, err = RotateKeyset(handle, metadata, &RotateOpts{
+		TimeSource: ar.now,
+		Logger:     ar.logger,
+	})
+	if err != nil {
+		logger.Error("Failed to rotate provisioned keyset", "error", err)
+		return fmt.Errorf("failed to rotate provisioned keyset: %w", err)
 	}
 
 	// 6. Write to store (expecting nil context for initial write)
