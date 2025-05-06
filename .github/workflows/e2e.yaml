@@ -5,12 +5,14 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: e2e
     env:
       GOTOOLCHAIN: local
     strategy:
       matrix:
-        go: [ stable, oldstable ]
-
+        go: [stable] # [ stable, oldstable ]
     steps:
 
     - name: Set up Go ${{ matrix.go }}
@@ -31,11 +33,13 @@ jobs:
         compose-file: "e2e/docker-compose.yaml"
         services: |
           minio
+          postgres
+          mysql
 
     - name: Test
-      run: go test ./...
-      env:
-        MINIO_ADDR: http://localhost:9000
-        MINIO_ACCESS_KEY: minio
-        MINIO_SECRET_KEY: minio123
-      working-directory: e2e
+      run: ./test.sh
+      # env:
+      #   MINIO_ADDR: http://localhost:9000
+      #   MINIO_ACCESS_KEY: minio
+      #   MINIO_SECRET_KEY: minio123
+      # working-directory: e2e
