@@ -164,7 +164,7 @@ func (s *SQLStore) ReadKeysetAndMetadata(ctx context.Context, keysetName string)
 }
 
 // WriteKeysetAndMetadata implements the ManagedStore interface.
-func (s *SQLStore) WriteKeysetAndMetadata(ctx context.Context, keysetName string, handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationMetadata, expectedContext interface{}) error {
+func (s *SQLStore) WriteKeysetAndMetadata(ctx context.Context, keysetName string, handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationMetadata, expectedContext any) error {
 	if handle == nil || metadata == nil {
 		return errors.New("handle and metadata cannot be nil for writing")
 	}

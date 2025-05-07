@@ -24,7 +24,7 @@ type ReadResult struct {
 	// Context is an opaque value used by the Store implementation for optimistic locking.
 	// For SQLStore, this will typically be the version number (int64 or int).
 	// For initial creation read, Context might be nil or a specific value indicating not found.
-	Context interface{}
+	Context any
 }
 
 // Store defines the interface for retrieving Tink keyset handles.
@@ -63,7 +63,7 @@ type ManagedStore interface {
 	//   by ReadKeysetAndMetadata when ErrKeysetNotFound was returned), this performs
 	//   an initial write (e.g., INSERT).
 	// Implementations should handle serialization and potential encryption (using a KEK).
-	WriteKeysetAndMetadata(ctx context.Context, keysetName string, handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationMetadata, expectedContext interface{}) error
+	WriteKeysetAndMetadata(ctx context.Context, keysetName string, handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationMetadata, expectedContext any) error
 
 	// ForEachKeyset iterates over all known keyset names in the store and calls
 	// the provided function `fn` for each keyset name. If `fn` returns an error,

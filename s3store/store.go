@@ -162,7 +162,7 @@ func (s *S3Store) ReadKeysetAndMetadata(ctx context.Context, keysetName string) 
 
 // WriteKeysetAndMetadata implements the ManagedStore interface using conditional PutObject.
 // NOTE: The keysetName parameter is ignored as S3Store manages a single object.
-func (s *S3Store) WriteKeysetAndMetadata(ctx context.Context, keysetName string, handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationMetadata, expectedContext interface{}) error {
+func (s *S3Store) WriteKeysetAndMetadata(ctx context.Context, keysetName string, handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationMetadata, expectedContext any) error {
 	slog.Debug("S3Store: WriteKeysetAndMetadata called", "bucket", s.bucket, "objectKey", s.objectKey, "ignoredKeysetName", keysetName)
 	if handle == nil || metadata == nil {
 		return errors.New("handle and metadata cannot be nil for writing")
