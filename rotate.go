@@ -57,7 +57,6 @@ func RotateKeyset(
 	opts *RotateOpts,
 ) (*keyset.Handle, *tinkrotatev1.KeyRotationMetadata, bool, error) {
 
-	// --- Setup Logger ---
 	var logger *slog.Logger
 	if opts != nil && opts.Logger != nil {
 		logger = opts.Logger
@@ -66,7 +65,6 @@ func RotateKeyset(
 	}
 	logger = logger.With("function", "RotateKeyset")
 
-	// --- Validate Inputs ---
 	if handle == nil {
 		return nil, nil, false, errors.New("keyset handle cannot be nil")
 	}
@@ -93,14 +91,12 @@ func RotateKeyset(
 		currentTime = opts.TimeSource()
 	}
 
-	// --- Policy Durations (extracted for readability) ---
 	primaryDuration := policy.PrimaryDuration.AsDuration()
 	propagationTime := policy.PropagationTime.AsDuration()
 	phaseOutDuration := policy.PhaseOutDuration.AsDuration()
 	deletionGracePeriod := policy.DeletionGracePeriod.AsDuration()
 	keyTemplate := policy.KeyTemplate
 
-	// --- Consistency Check ---
 	inconsistencies := CheckConsistency(handle, metadata)
 	if len(inconsistencies) > 0 {
 		// Allow processing even with inconsistencies? For now, return error.
@@ -111,7 +107,6 @@ func RotateKeyset(
 	ksInfo := handle.KeysetInfo()
 	updated := false // Track if any changes were made
 
-	// --- Build current state view ---
 	keyInfos := make(map[uint32]*KeyInfo) // Map key ID to combined info
 	var primaryKey *KeyInfo
 	var pendingKeys []*KeyInfo
@@ -175,7 +170,6 @@ func RotateKeyset(
 		return t1.Before(t2)
 	})
 
-	// --- 1. Process Deletions ---
 	keysToDelete := []uint32{}
 	for _, ki := range disabledKeys {
 		if ki.Metadata == nil || ki.Metadata.DeletionTime == nil {
@@ -196,7 +190,7 @@ func RotateKeyset(
 				if err != nil {
 					logger.Error("Failed to delete key.", "keyID", ki.KeyID, "error", err)
 				} else {
-					keysToDelete = append(keysToDelete, ki.KeyID) // Mark for metadata removal
+					keysToDelete = append(keysToDelete, ki.KeyID)
 					updated = true
 				}
 			} else {
@@ -211,7 +205,6 @@ func RotateKeyset(
 		delete(metadata.KeyMetadata, keyID)
 	}
 
-	// --- 2. Process Disabling (Phasing-Out -> Disabled) ---
 	for _, ki := range phasingOutKeys {
 		if ki.Metadata == nil {
 			logger.Warn("Phasing-out key missing metadata. Skipping disable check.", "keyID", ki.KeyID)
@@ -268,7 +261,6 @@ func RotateKeyset(
 		}
 	}
 
-	// --- 3. Process Promotion (Pending -> Primary) ---
 	if primaryKey != nil {
 		if primaryKey.Metadata == nil {
 			logger.Warn("Primary key missing metadata. Skipping promotion check.", "keyID", primaryKey.KeyID)
@@ -326,11 +318,11 @@ func RotateKeyset(
 
 							updated = true
 							promoted = true
-							break // Promotion successful
+							break
 						} else {
 							logger.Info("Primary key expired, but pending key hasn't met propagation time. Waiting.",
 								"primary_key_id", primaryKey.KeyID, "pending_key_id", pendingKey.KeyID, "propagation_time_remaining", propagationEndTime.Sub(currentTime).Round(time.Second), "propagation_end_time", propagationEndTime.Format(time.RFC3339))
-							break // Block promotion, wait for next cycle
+							break
 						}
 					}
 					if !promoted && len(pendingKeys) > 0 {
@@ -377,7 +369,6 @@ func RotateKeyset(
 		}
 	}
 
-	// --- Refresh state after potential promotion/generation ---
 	// Get potentially updated handle info
 	ksInfoHandle, err := manager.Handle()
 	if err != nil {
@@ -385,8 +376,8 @@ func RotateKeyset(
 		// and not proceed with generating a new key based on potentially stale info.
 		return handle, metadata, updated, fmt.Errorf("failed to get intermediate handle from manager: %w", err)
 	}
-	ksInfo = ksInfoHandle.KeysetInfo() // Use the latest info
-	primaryKey = nil                   // Reset and find again based on latest ksInfo and metadata
+	ksInfo = ksInfoHandle.KeysetInfo()
+	primaryKey = nil
 	hasPending := false
 	// Re-scan metadata and latest KeysetInfo to determine current primary and if pending exists
 	for _, keyInfo := range ksInfo.GetKeyInfo() {
@@ -414,13 +405,13 @@ func RotateKeyset(
 				if primaryKey != nil {
 					// This case was logged earlier, stick with the first one encountered
 				} else {
-					primaryKey = currentKeyInfo // Found the primary
+					primaryKey = currentKeyInfo
 				}
 			} else {
 				// Metadata says primary, but Tink disagrees. Correct metadata.
 				logger.Warn("Metadata state for key is PRIMARY, but Tink primary is different. Setting state to PHASING_OUT.", "keyID", keyInfo.GetKeyId(), "tink_primary_id", ksInfo.GetPrimaryKeyId())
 				meta.State = tinkrotatev1.KeyState_KEY_STATE_PHASING_OUT
-				meta.PromotionTime = nil // Clear promotion time
+				meta.PromotionTime = nil
 				updated = true
 			}
 		}
@@ -449,7 +440,6 @@ func RotateKeyset(
 		}
 	}
 
-	// --- 4. Generate New Pending Key ---
 	if primaryKey != nil && !hasPending {
 		logger.Info("Generating new PENDING key (Primary exists, no pending key found).", "primary_key_id", primaryKey.KeyID)
 		keyID, err := manager.Add(keyTemplate)
@@ -467,7 +457,6 @@ func RotateKeyset(
 		logger.Info("Generated new PENDING key.", "keyID", keyID)
 	}
 
-	// --- Return updated handle and metadata ---
 	var finalHandle *keyset.Handle
 	if updated {
 		finalHandle, err = manager.Handle()
@@ -476,7 +465,7 @@ func RotateKeyset(
 			return handle, metadata, updated, fmt.Errorf("failed to get final handle from manager: %w", err)
 		}
 	} else {
-		finalHandle = handle // No changes
+		finalHandle = handle
 	}
 
 	// Final consistency check before returning?
@@ -515,7 +504,6 @@ type KeyInfo struct {
 func CheckConsistency(handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationMetadata) []error {
 	var inconsistencies []error
 
-	// Create a default logger for CheckConsistency, as it doesn't have RotateOpts
 	// This could be passed in if CheckConsistency is used in other contexts needing specific logging.
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil)).With("function", "CheckConsistency")
 
@@ -544,7 +532,6 @@ func CheckConsistency(handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationM
 		}
 	}
 
-	// --- 1. Key ID Matching ---
 	tinkKeyIDs := make(map[uint32]*tinkpb.KeysetInfo_KeyInfo)
 	for _, ki := range ksInfo.GetKeyInfo() {
 		if ki == nil {
@@ -582,7 +569,6 @@ func CheckConsistency(handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationM
 		}
 	}
 
-	// --- 2. Primary Key Consistency ---
 	tinkPrimaryID := ksInfo.GetPrimaryKeyId()
 	var metadataPrimaryID uint32
 	primaryCount := 0
@@ -625,7 +611,6 @@ func CheckConsistency(handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationM
 		}
 	}
 
-	// --- 3. Status Alignment ---
 	for kID, tinkInfo := range tinkKeyIDs {
 		meta, metaExists := metadataKeyIDs[kID]
 		// If metadata doesn't exist, it was already flagged in check #1. Skip status check.

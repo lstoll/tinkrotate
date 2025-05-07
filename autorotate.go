@@ -68,7 +68,6 @@ func NewAutoRotator(store ManagedStore, checkInterval time.Duration, opts *AutoR
 		return nil, errors.New("checkInterval must be positive")
 	}
 
-	// Validate policies within opts before creating the AutoRotator
 	provisionPolicies := make(map[string]*tinkrotatev1.RotationPolicy)
 	var logger *slog.Logger
 	if opts != nil {
@@ -80,12 +79,11 @@ func NewAutoRotator(store ManagedStore, checkInterval time.Duration, opts *AutoR
 				if err := ValidateRotationPolicy(policy); err != nil {
 					return nil, fmt.Errorf("invalid policy provided in ProvisionPolicies for keyset '%s': %w", name, err)
 				}
-				provisionPolicies[name] = policy // Store validated policy
+				provisionPolicies[name] = policy
 			}
 		}
 	}
 
-	// Setup default logger if none provided
 	if logger == nil {
 		logger = slog.Default().With("component", "autorotator")
 	}
@@ -93,10 +91,10 @@ func NewAutoRotator(store ManagedStore, checkInterval time.Duration, opts *AutoR
 	ar := &AutoRotator{
 		store:             store,
 		checkInterval:     checkInterval,
-		now:               time.Now,          // Default to real time
-		provisionPolicies: provisionPolicies, // Assign validated map
+		now:               time.Now,
+		provisionPolicies: provisionPolicies,
 		running:           false,
-		logger:            logger, // Assign the logger
+		logger:            logger,
 	}
 
 	if opts != nil && opts.TimeSource != nil {
@@ -118,10 +116,8 @@ func (ar *AutoRotator) RunOnce(ctx context.Context) error {
 	processedKeys := make(map[string]struct{}) // Track keys processed by ForEachKeyset
 
 	// 1. Process existing keys found in the store
-	ar.logger.Debug("Processing existing keysets found in store")
 	err := ar.store.ForEachKeyset(ctx, func(keysetName string) error {
-		ar.logger.Debug("Processing existing keyset", "keyset_name", keysetName)
-		processedKeys[keysetName] = struct{}{} // Mark as processed
+		processedKeys[keysetName] = struct{}{}
 		runErr := ar.processSingleKeyset(ctx, keysetName)
 		if runErr != nil {
 			ar.logger.Error("Error processing keyset", "keyset_name", keysetName, "error", runErr)
@@ -147,14 +143,11 @@ func (ar *AutoRotator) RunOnce(ctx context.Context) error {
 
 	// 2. Process keys specified for provisioning if they weren't already processed
 	if len(ar.provisionPolicies) > 0 {
-		ar.logger.Debug("Checking specified keysets for provisioning")
 		for keysetName, policy := range ar.provisionPolicies {
 			if _, alreadyProcessed := processedKeys[keysetName]; alreadyProcessed {
-				ar.logger.Debug("Keyset already processed, skipping provisioning check", "keyset_name", keysetName)
 				continue
 			}
 
-			ar.logger.Debug("Checking existence of specified keyset for potential provisioning", "keyset_name", keysetName)
 			// Check if it exists now. We expect ErrKeysetNotFound if we need to provision.
 			_, readErr := ar.store.ReadKeysetAndMetadata(ctx, keysetName)
 
@@ -201,7 +194,7 @@ func (ar *AutoRotator) processSingleKeyset(ctx context.Context, keysetName strin
 			// This should ideally not happen if ForEachKeyset is consistent,
 			// but handle it gracefully. RunOnce doesn't provision.
 			ar.logger.Warn("Keyset not found during processing (skipped)", "keyset_name", keysetName)
-			return nil // Not an error for RunOnce, just skip.
+			return nil
 		}
 		// Other read errors are fatal for this keyset
 		return fmt.Errorf("failed to read from store for keyset '%s': %w", keysetName, err)
@@ -221,7 +214,7 @@ func (ar *AutoRotator) processSingleKeyset(ctx context.Context, keysetName strin
 	// A valid policy is required for rotation
 	if currentMetadata.RotationPolicy == nil {
 		ar.logger.Warn("Skipping keyset because metadata lacks a RotationPolicy", "keyset_name", keysetName)
-		return ErrRotationPolicyMissing // Return specific error
+		return ErrRotationPolicyMissing
 	}
 	// Validate the policy structure itself (durations, template presence)
 	if err := ValidateRotationPolicy(currentMetadata.RotationPolicy); err != nil {
@@ -234,9 +227,6 @@ func (ar *AutoRotator) processSingleKeyset(ctx context.Context, keysetName strin
 	// Clone the original keyset info for comparison
 	originalKeysetInfoClone := proto.Clone(currentHandle.KeysetInfo())
 
-	ar.logger.Debug("Read keyset from store, processing rotation", "keyset_name", keysetName, "context", currentContext)
-
-	// --- Perform Rotation Logic using the standalone function ---
 	// Use the AutoRotator's time source
 	newHandle, newMetadata, rotated, rotationErr := RotateKeyset(currentHandle, currentMetadata, &RotateOpts{
 		TimeSource: func() time.Time {
@@ -259,7 +249,6 @@ func (ar *AutoRotator) processSingleKeyset(ctx context.Context, keysetName strin
 
 	// --- Write Back to Store (Only If Changed) ---
 	if !rotated {
-		ar.logger.Debug("No changes detected by RotateKeyset, skipping write", "keyset_name", keysetName)
 		// Sanity check: if RotateKeyset reports no changes, our deep comparison should also find no changes.
 		if metadataChanged || keysetChanged {
 			ar.logger.Warn("RotateKeyset reported no rotation, but proto.Equal detected changes. This indicates a discrepancy.", "keyset_name", keysetName, "metadata_changed_by_equal", metadataChanged, "keyset_changed_by_equal", keysetChanged)
@@ -404,7 +393,7 @@ func (ar *AutoRotator) ProvisionKeyset(ctx context.Context, keysetName string, p
 		logger.Error("Provisioning failed: Failed to add initial key", "error", err)
 		return err
 	}
-	logger = logger.With("initial_key_id", keyID) // Add key ID to context
+	logger = logger.With("initial_key_id", keyID)
 	err = manager.SetPrimary(keyID)
 	if err != nil {
 		err = fmt.Errorf("failed to set initial primary key for keyset '%s': %w", keysetName, err)
@@ -421,13 +410,13 @@ func (ar *AutoRotator) ProvisionKeyset(ctx context.Context, keysetName string, p
 	// 5. Create initial metadata, embedding the *provided policy*
 	now := ar.now()
 	metadata := &tinkrotatev1.KeyRotationMetadata{
-		RotationPolicy: policy, // Embed the provided policy
+		RotationPolicy: policy,
 		KeyMetadata: map[uint32]*tinkrotatev1.KeyMetadata{
 			keyID: {
 				KeyId:         keyID,
 				State:         tinkrotatev1.KeyState_KEY_STATE_PRIMARY,
 				CreationTime:  timestamppb.New(now),
-				PromotionTime: timestamppb.New(now), // Primary on creation
+				PromotionTime: timestamppb.New(now),
 			},
 		},
 	}
