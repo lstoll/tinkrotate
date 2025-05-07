@@ -9,6 +9,8 @@ import (
 
 	// "github.com/stretchr/testify/assert"  // Removed
 	// "github.com/stretchr/testify/require" // Removed
+	"log/slog"
+
 	tinkrotatev1 "github.com/lstoll/tinkrotate/proto/tinkrotate/v1"
 	"github.com/tink-crypto/tink-go/v2/aead"
 	"github.com/tink-crypto/tink-go/v2/keyset" // Keep for cloning
@@ -16,6 +18,17 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+// testWriter is a simple io.Writer that writes to t.Logf.
+// Used to pipe slog output to test logs.
+type testWriter struct {
+	t *testing.T
+}
+
+func (tw testWriter) Write(p []byte) (n int, err error) {
+	tw.t.Logf("%s", p) // Logf will add a newline if one isn't present
+	return len(p), nil
+}
 
 // Helper to create a test policy proto
 func createTestPolicy(primary time.Duration, propagation time.Duration, phaseOut time.Duration, deletionGrace time.Duration) *tinkrotatev1.RotationPolicy {
@@ -138,12 +151,19 @@ func TestRotatorEndToEnd(t *testing.T) {
 		}
 
 		// 3. Run rotator function (using the current time *before* advancing it)
-		newHandle, newMetadata, err := RotateKeyset(handle, metadata, &RotateOpts{
+		newHandle, newMetadata, rotated, err := RotateKeyset(handle, metadata, &RotateOpts{
 			TimeSource: func() time.Time {
 				return currentTime
 			},
+			// Add logger to test output for easier debugging of rotation steps
+			Logger: slog.New(slog.NewTextHandler(testWriter{t}, &slog.HandlerOptions{Level: slog.LevelDebug})).With("sim_time", simTime.String()),
 		})
 		requireNoError(t, err, "[%s] RotateKeyset failed", simTime) // Check error at current time
+		if rotated {
+			t.Logf("[%s] RotateKeyset reported changes.", simTime)
+		} else {
+			t.Logf("[%s] RotateKeyset reported NO changes.", simTime)
+		}
 
 		// Update handle and metadata for the next iteration
 		handle = newHandle

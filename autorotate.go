@@ -238,7 +238,7 @@ func (ar *AutoRotator) processSingleKeyset(ctx context.Context, keysetName strin
 
 	// --- Perform Rotation Logic using the standalone function ---
 	// Use the AutoRotator's time source
-	newHandle, newMetadata, rotationErr := RotateKeyset(currentHandle, currentMetadata, &RotateOpts{
+	newHandle, newMetadata, rotated, rotationErr := RotateKeyset(currentHandle, currentMetadata, &RotateOpts{
 		TimeSource: func() time.Time {
 			return ar.now()
 		},
@@ -258,12 +258,18 @@ func (ar *AutoRotator) processSingleKeyset(ctx context.Context, keysetName strin
 	keysetChanged := !proto.Equal(originalKeysetInfoClone, newHandle.KeysetInfo())
 
 	// --- Write Back to Store (Only If Changed) ---
-	if !metadataChanged && !keysetChanged {
-		ar.logger.Debug("No changes detected, skipping write", "keyset_name", keysetName)
-		return nil
+	if !rotated {
+		ar.logger.Debug("No changes detected by RotateKeyset, skipping write", "keyset_name", keysetName)
+		// Sanity check: if RotateKeyset reports no changes, our deep comparison should also find no changes.
+		if metadataChanged || keysetChanged {
+			ar.logger.Warn("RotateKeyset reported no rotation, but proto.Equal detected changes. This indicates a discrepancy.", "keyset_name", keysetName, "metadata_changed_by_equal", metadataChanged, "keyset_changed_by_equal", keysetChanged)
+			// Proceed to write anyway if proto.Equal detected changes, as that's the more robust check.
+		} else {
+			return nil
+		}
 	}
 
-	ar.logger.Info("Changes detected, attempting write", "keyset_name", keysetName, "metadata_changed", metadataChanged, "keyset_changed", keysetChanged, "context", currentContext)
+	ar.logger.Info("Changes indicated by RotateKeyset, attempting write", "keyset_name", keysetName, "metadata_changed_by_equal", metadataChanged, "keyset_changed_by_equal", keysetChanged, "context", currentContext)
 
 	writeErr := ar.store.WriteKeysetAndMetadata(ctx, keysetName, newHandle, newMetadata, currentContext)
 
@@ -427,7 +433,7 @@ func (ar *AutoRotator) ProvisionKeyset(ctx context.Context, keysetName string, p
 	}
 
 	// Run a rotate to ensure pending keys are provisioned
-	handle, metadata, err = RotateKeyset(handle, metadata, &RotateOpts{
+	handle, metadata, _, err = RotateKeyset(handle, metadata, &RotateOpts{
 		TimeSource: ar.now,
 		Logger:     ar.logger,
 	})

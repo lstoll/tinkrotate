@@ -55,7 +55,7 @@ func RotateKeyset(
 	handle *keyset.Handle,
 	metadata *tinkrotatev1.KeyRotationMetadata,
 	opts *RotateOpts,
-) (*keyset.Handle, *tinkrotatev1.KeyRotationMetadata, error) {
+) (*keyset.Handle, *tinkrotatev1.KeyRotationMetadata, bool, error) {
 
 	// --- Setup Logger ---
 	var logger *slog.Logger
@@ -68,12 +68,12 @@ func RotateKeyset(
 
 	// --- Validate Inputs ---
 	if handle == nil {
-		return nil, nil, errors.New("keyset handle cannot be nil")
+		return nil, nil, false, errors.New("keyset handle cannot be nil")
 	}
 	if metadata == nil {
 		// If handle is not empty, require metadata
 		if len(handle.KeysetInfo().GetKeyInfo()) > 0 {
-			return nil, nil, errors.New("metadata cannot be nil for non-empty keyset")
+			return nil, nil, false, errors.New("metadata cannot be nil for non-empty keyset")
 		}
 		// Allow nil metadata only if handle is also effectively empty/new
 		metadata = &tinkrotatev1.KeyRotationMetadata{}
@@ -85,7 +85,7 @@ func RotateKeyset(
 	// Get and validate the policy *from the metadata*
 	policy := metadata.RotationPolicy
 	if err := ValidateRotationPolicy(policy); err != nil {
-		return nil, nil, fmt.Errorf("invalid rotation policy in metadata: %w", err)
+		return nil, nil, false, fmt.Errorf("invalid rotation policy in metadata: %w", err)
 	}
 
 	currentTime := time.Now()
@@ -104,7 +104,7 @@ func RotateKeyset(
 	inconsistencies := CheckConsistency(handle, metadata)
 	if len(inconsistencies) > 0 {
 		// Allow processing even with inconsistencies? For now, return error.
-		return nil, nil, fmt.Errorf("inconsistencies found before rotation: %v", inconsistencies)
+		return nil, nil, false, fmt.Errorf("inconsistencies found before rotation: %v", inconsistencies)
 	}
 
 	manager := keyset.NewManagerFromHandle(handle)
@@ -383,7 +383,7 @@ func RotateKeyset(
 	if err != nil {
 		// If we can't get the handle after potential changes, it's safer to return error
 		// and not proceed with generating a new key based on potentially stale info.
-		return handle, metadata, fmt.Errorf("failed to get intermediate handle from manager: %w", err)
+		return handle, metadata, updated, fmt.Errorf("failed to get intermediate handle from manager: %w", err)
 	}
 	ksInfo = ksInfoHandle.KeysetInfo() // Use the latest info
 	primaryKey = nil                   // Reset and find again based on latest ksInfo and metadata
@@ -455,7 +455,7 @@ func RotateKeyset(
 		keyID, err := manager.Add(keyTemplate)
 		if err != nil {
 			// Error adding key, return previous state and error
-			return handle, metadata, fmt.Errorf("failed to add new key to manager: %w", err)
+			return handle, metadata, updated, fmt.Errorf("failed to add new key to manager: %w", err)
 		}
 		newMeta := &tinkrotatev1.KeyMetadata{
 			KeyId:        keyID,
@@ -473,7 +473,7 @@ func RotateKeyset(
 		finalHandle, err = manager.Handle()
 		if err != nil {
 			// Failed to get the *final* handle after all updates.
-			return handle, metadata, fmt.Errorf("failed to get final handle from manager: %w", err)
+			return handle, metadata, updated, fmt.Errorf("failed to get final handle from manager: %w", err)
 		}
 	} else {
 		finalHandle = handle // No changes
@@ -486,7 +486,7 @@ func RotateKeyset(
 		// Decide: return error, or return the state anyway? Returning state for now.
 	}
 
-	return finalHandle, metadata, nil
+	return finalHandle, metadata, updated, nil
 }
 
 // Helper to find Tink KeyInfo within a manager/handle
