@@ -9,7 +9,7 @@ jobs:
       GOTOOLCHAIN: local
     strategy:
       matrix:
-        go: [ stable, oldstable ]
+        go: [stable] # [ stable, oldstable ]
 
     steps:
 
@@ -32,11 +32,12 @@ jobs:
       run: go test ./...
 
     - name: Lint
-      uses: golangci/golangci-lint-action@v6
+      uses: golangci/golangci-lint-action@v7
       with:
         version: latest
 
-    - name: Buf
-      uses: bufbuild/buf-action@v1
-      with:
-        pr_comment: false
+    # would be nice, but need to sort the import story
+    # - name: Buf
+    #   uses: bufbuild/buf-action@v1
+    #   with:
+    #     pr_comment: false

@@ -16,28 +16,46 @@ var (
 	ErrOptimisticLockFailed = errors.New("optimistic lock failed: keyset or metadata modified concurrently")
 )
 
-// ReadResult encapsulates the data read from the store and context for optimistic locking.
+// ReadResult encapsulates the data read from the store and context for optimistic locking,
+// primarily used by the ManagedStore interface for rotation logic.
 type ReadResult struct {
 	Handle   *keyset.Handle
 	Metadata *tinkrotatev1.KeyRotationMetadata
 	// Context is an opaque value used by the Store implementation for optimistic locking.
 	// For SQLStore, this will typically be the version number (int64 or int).
 	// For initial creation read, Context might be nil or a specific value indicating not found.
-	Context interface{}
+	Context any
 }
 
-// Store defines the interface for persisting and retrieving Tink keysets and their rotation metadata.
-// Implementations are responsible for handling potential encryption of the keyset data
-// and for ensuring atomicity and preventing race conditions during writes, typically
-// via optimistic locking using the Context field from ReadResult.
+// Store defines the interface for retrieving Tink keyset handles.
+// This is intended for consumers that need to use the keysets (e.g., for encryption/decryption).
 type Store interface {
-	// ReadKeysetAndMetadata retrieves the current keyset handle and its rotation metadata.
+	// GetCurrentHandle retrieves the current *full* keyset handle (including private key
+	// material) for the specified keyset name. Returns ErrKeysetNotFound if the
+	// keyset doesn't exist.
+	GetCurrentHandle(ctx context.Context, keysetName string) (*keyset.Handle, error)
+
+	// GetPublicKeySetHandle retrieves the public keyset handle for the specified keyset name.
+	// This is safer for distribution as it does not contain private key material.
+	// Returns ErrKeysetNotFound if the keyset doesn't exist.
+	GetPublicKeySetHandle(ctx context.Context, keysetName string) (*keyset.Handle, error)
+}
+
+// ManagedStore extends the Store interface with methods required for keyset management
+// and rotation, including reading/writing metadata and iterating over keysets.
+// This interface is typically used by the AutoRotator.
+type ManagedStore interface {
+	Store // Embed the read-only Store interface
+
+	// ReadKeysetAndMetadata retrieves the current keyset handle and its rotation metadata
+	// for the specified keyset name.
 	// If the keyset does not exist, it should return (nil, ErrKeysetNotFound).
 	// It also returns an opaque Context value to be used in WriteKeysetAndMetadata for
 	// optimistic locking.
-	ReadKeysetAndMetadata(ctx context.Context) (*ReadResult, error)
+	ReadKeysetAndMetadata(ctx context.Context, keysetName string) (*ReadResult, error)
 
-	// WriteKeysetAndMetadata persists the given keyset handle and metadata.
+	// WriteKeysetAndMetadata persists the given keyset handle and metadata for the specified
+	// keyset name.
 	// - If expectedContext corresponds to a previous ReadResult, the write should only
 	//   succeed if the underlying data hasn't changed since that read (optimistic lock).
 	//   On lock failure, it must return ErrOptimisticLockFailed.
@@ -45,5 +63,11 @@ type Store interface {
 	//   by ReadKeysetAndMetadata when ErrKeysetNotFound was returned), this performs
 	//   an initial write (e.g., INSERT).
 	// Implementations should handle serialization and potential encryption (using a KEK).
-	WriteKeysetAndMetadata(ctx context.Context, handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationMetadata, expectedContext interface{}) error
+	WriteKeysetAndMetadata(ctx context.Context, keysetName string, handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationMetadata, expectedContext any) error
+
+	// ForEachKeyset iterates over all known keyset names in the store and calls
+	// the provided function `fn` for each keyset name. If `fn` returns an error,
+	// the iteration stops and the error is returned. Implementations may choose
+	// to perform iteration in batches for efficiency.
+	ForEachKeyset(ctx context.Context, fn func(keysetName string) error) error
 }

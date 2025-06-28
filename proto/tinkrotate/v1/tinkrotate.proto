@@ -2,9 +2,11 @@ syntax = "proto3";
 
 package lstoll.tinkrotate.v1;
 
+import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
+import "google/crypto/tink/tink.proto";
 
-option go_package = ".;tinkrotatev1";
+option go_package = "github.com/lstoll/tinkrotate/proto/tinkrotate/v1;tinkrotatev1";
 
 // KeyState defines the lifecycle state of a key within the rotation policy.
 enum KeyState {
@@ -14,6 +16,28 @@ enum KeyState {
   KEY_STATE_PHASING_OUT = 3; // Previous primary, used only for verification/decryption
   KEY_STATE_DISABLED = 4; // Key is no longer used for any operation, awaiting deletion
   // No DESTROYED/DELETED state here, as its absence from metadata implies deletion
+}
+
+// RotationPolicy defines the parameters for automated key rotation for a specific keyset.
+message RotationPolicy {
+  // The specific key template to use when generating new keys for this keyset.
+  // This field MUST be set.
+  google.crypto.tink.KeyTemplate key_template = 1;
+
+  // Duration a key stays PRIMARY before rotation is initiated. MUST be positive.
+  google.protobuf.Duration primary_duration = 2;
+
+  // Minimum time a PENDING key must exist before it's eligible for PRIMARY promotion.
+  // MUST be non-negative and <= primary_duration.
+  google.protobuf.Duration propagation_time = 3;
+
+  // Duration a key stays PHASING_OUT (after being primary) before being DISABLED.
+  // MUST be non-negative.
+  google.protobuf.Duration phase_out_duration = 4;
+
+  // Duration a key stays DISABLED before being marked for deletion (DESTROYED).
+  // MUST be non-negative.
+  google.protobuf.Duration deletion_grace_period = 5;
 }
 
 // KeyMetadata stores rotation-specific information for a single key within a Tink Keyset.
@@ -39,7 +63,10 @@ message KeyMetadata {
 
 // KeyRotationMetadata encapsulates metadata for all keys in a managed keyset.
 message KeyRotationMetadata {
-  map<uint32, KeyMetadata> key_metadata = 1;
+  // The rotation policy governing this specific keyset.
+  // This field MUST be set for the AutoRotator to manage this keyset.
+  RotationPolicy rotation_policy = 1;
 
-  // TODO - generic metadata and space for keyset bytes
+  // Metadata for each individual key within the keyset, keyed by Key ID.
+  map<uint32, KeyMetadata> key_metadata = 2;
 }
