@@ -23,7 +23,7 @@ func TestAutoRotator_SQLite_BlackBox(t *testing.T) {
 
 	// --- Store Setup ---
 	// Pass nil for options to use defaults (table name = "tink_keysets", no KEK)
-	sqlStore, err := tinkrotate.NewSQLStore(db, &tinkrotate.SQLStoreOptions{Dialect: "sqlite"})
+	sqlStore, err := tinkrotate.NewSQLStore(db, &tinkrotate.SQLStoreOptions{Dialect: tinkrotate.SQLDialectSQLite})
 	if err != nil {
 		t.Fatalf("Failed to create SQLStore: %v", err)
 	}
@@ -52,7 +52,7 @@ func TestAutoRotator_MySQL_BlackBox(t *testing.T) {
 	defer db.Close()
 
 	// --- Store Setup ---
-	sqlStore, err := tinkrotate.NewSQLStore(db, &tinkrotate.SQLStoreOptions{Dialect: "mysql"})
+	sqlStore, err := tinkrotate.NewSQLStore(db, &tinkrotate.SQLStoreOptions{Dialect: tinkrotate.SQLDialectMySQL})
 	if err != nil {
 		t.Fatalf("Failed to create SQLStore: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestAutoRotator_Postgres_BlackBox(t *testing.T) {
 	defer db.Close()
 
 	// --- Store Setup ---
-	sqlStore, err := tinkrotate.NewSQLStore(db, &tinkrotate.SQLStoreOptions{Dialect: "postgres"})
+	sqlStore, err := tinkrotate.NewSQLStore(db, &tinkrotate.SQLStoreOptions{Dialect: tinkrotate.SQLDialectPostgreSQL})
 	if err != nil {
 		t.Fatalf("Failed to create SQLStore: %v", err)
 	}

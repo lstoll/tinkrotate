@@ -36,13 +36,11 @@ type s3StoredData struct {
 // S3Store implements the Store interface using AWS S3.
 // It stores the keyset and metadata combined in a single JSON object.
 // Conditional writes are handled using S3 ETags (IfMatch / IfNoneMatch).
-// NOTE: This implementation manages only a SINGLE keyset defined by the objectKey.
-// The keysetName parameter in interface methods is ignored.
 type S3Store struct {
-	s3Client  *s3.Client
-	bucket    string
-	objectKey string    // The full S3 key (path) for the object
-	kek       tink.AEAD // Optional: Key-Encryption-Key for the keyset handle data
+	s3Client *s3.Client
+	bucket   string
+	prefix   string    // prefix for objectx in bucket
+	kek      tink.AEAD // Optional: Key-Encryption-Key for the keyset handle data
 }
 
 // S3StoreOption is used to configure S3Store.
@@ -55,25 +53,27 @@ func WithS3KEK(kek tink.AEAD) S3StoreOption {
 	}
 }
 
+func WithS3Prefix(prefix string) S3StoreOption {
+	return func(s *S3Store) {
+		s.prefix = prefix
+	}
+}
+
 // NewS3Store creates a new S3Store instance.
 // s3Client: An initialized *s3.Client.
 // bucket: The S3 bucket name.
 // objectKey: The S3 object key (path) where the data will be stored.
-func NewS3Store(s3Client *s3.Client, bucket, objectKey string, opts ...S3StoreOption) (*S3Store, error) {
+func NewS3Store(s3Client *s3.Client, bucket string, opts ...S3StoreOption) (*S3Store, error) {
 	if s3Client == nil {
 		return nil, errors.New("s3 client cannot be nil")
 	}
 	if bucket == "" {
 		return nil, errors.New("s3 bucket name cannot be empty")
 	}
-	if objectKey == "" {
-		return nil, errors.New("s3 object key cannot be empty")
-	}
 
 	s := &S3Store{
-		s3Client:  s3Client,
-		bucket:    bucket,
-		objectKey: objectKey,
+		s3Client: s3Client,
+		bucket:   bucket,
 	}
 
 	for _, opt := range opts {
@@ -86,10 +86,10 @@ func NewS3Store(s3Client *s3.Client, bucket, objectKey string, opts ...S3StoreOp
 // ReadKeysetAndMetadata implements the ManagedStore interface.
 // NOTE: The keysetName parameter is ignored as S3Store manages a single object.
 func (s *S3Store) ReadKeysetAndMetadata(ctx context.Context, keysetName string) (*tinkrotate.ReadResult, error) {
-	slog.Debug("S3Store: ReadKeysetAndMetadata called", "bucket", s.bucket, "objectKey", s.objectKey, "ignoredKeysetName", keysetName)
+	slog.Debug("S3Store: ReadKeysetAndMetadata called", "bucket", s.bucket, "objectKey", s.objectKey(keysetName))
 	getInput := &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
-		Key:    aws.String(s.objectKey),
+		Key:    aws.String(s.objectKey(keysetName)),
 	}
 
 	getObjectOutput, err := s.s3Client.GetObject(ctx, getInput)
@@ -102,7 +102,7 @@ func (s *S3Store) ReadKeysetAndMetadata(ctx context.Context, keysetName string) 
 			return &tinkrotate.ReadResult{Context: ""}, tinkrotate.ErrKeysetNotFound
 		}
 		// Handle other S3 errors
-		return nil, fmt.Errorf("failed to get object %s/%s from S3: %w", s.bucket, s.objectKey, err)
+		return nil, fmt.Errorf("failed to get object %s/%s from S3: %w", s.bucket, s.objectKey(keysetName), err)
 	}
 	defer getObjectOutput.Body.Close()
 
@@ -123,7 +123,7 @@ func (s *S3Store) ReadKeysetAndMetadata(ctx context.Context, keysetName string) 
 	var handle *keyset.Handle
 	reader := keyset.NewBinaryReader(bytes.NewReader(stored.KeysetData))
 	if s.kek != nil {
-		handle, err = keyset.ReadWithAssociatedData(reader, s.kek, []byte(s.objectKey))
+		handle, err = keyset.ReadWithAssociatedData(reader, s.kek, []byte(keysetName))
 		if err != nil {
 			return nil, fmt.Errorf("failed to read keyset handle: %w", err)
 		}
@@ -197,7 +197,7 @@ func (s *S3Store) WriteKeysetAndMetadata(ctx context.Context, keysetName string,
 	keysetBuf := new(bytes.Buffer)
 	if s.kek != nil {
 		writer := keyset.NewBinaryWriter(keysetBuf)
-		err = handle.WriteWithAssociatedData(writer, s.kek, []byte(s.objectKey))
+		err = handle.WriteWithAssociatedData(writer, s.kek, []byte(keysetName))
 		if err != nil {
 			return fmt.Errorf("failed to write keyset handle: %w", err)
 		}
@@ -222,7 +222,7 @@ func (s *S3Store) WriteKeysetAndMetadata(ctx context.Context, keysetName string,
 	// Prepare S3 PutObjectInput
 	putInput := &s3.PutObjectInput{
 		Bucket: aws.String(s.bucket),
-		Key:    aws.String(s.objectKey),
+		Key:    aws.String(s.objectKey(keysetName)),
 		Body:   bytes.NewReader(bodyBytes),
 		// Consider setting ContentType: aws.String("application/json"),
 	}
@@ -268,13 +268,13 @@ func (s *S3Store) GetCurrentHandle(ctx context.Context, keysetName string) (*key
 	if err != nil {
 		// Map ErrKeysetNotFound correctly
 		if errors.Is(err, tinkrotate.ErrKeysetNotFound) {
-			return nil, fmt.Errorf("keyset '%s': %w", s.objectKey, tinkrotate.ErrKeysetNotFound)
+			return nil, fmt.Errorf("keyset '%s': %w", s.objectKey(keysetName), tinkrotate.ErrKeysetNotFound)
 		}
 		return nil, fmt.Errorf("failed to read for GetCurrentHandle: %w", err)
 	}
 	if readResult.Handle == nil {
 		// Should not happen if ReadKeysetAndMetadata returns nil error without ErrKeysetNotFound
-		return nil, fmt.Errorf("internal error: ReadKeysetAndMetadata succeeded but returned nil handle for %s", s.objectKey)
+		return nil, fmt.Errorf("internal error: ReadKeysetAndMetadata succeeded but returned nil handle for %s", s.objectKey(keysetName))
 	}
 	return readResult.Handle, nil
 }
@@ -290,21 +290,83 @@ func (s *S3Store) GetPublicKeySetHandle(ctx context.Context, keysetName string) 
 	// Extract public keyset handle
 	publicHandle, err := fullHandle.Public()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get public keyset handle for '%s': %w", s.objectKey, err)
+		return nil, fmt.Errorf("failed to get public keyset handle for '%s': %w", s.objectKey(keysetName), err)
 	}
 	return publicHandle, nil
 }
 
 // ForEachKeyset implements the ManagedStore interface.
-// NOTE: Since S3Store manages only a single keyset defined by its objectKey,
-// this function simply calls the callback `fn` once with the store's objectKey.
+// Lists all objects in the bucket with the configured prefix and calls fn for each keyset.
 func (s *S3Store) ForEachKeyset(ctx context.Context, fn func(keysetName string) error) error {
-	slog.Debug("S3Store: ForEachKeyset called", "bucket", s.bucket, "objectKey", s.objectKey)
-	// Call the function with the only keyset name this store knows about.
-	err := fn(s.objectKey)
-	if err != nil {
-		// If the callback function returns an error, return it wrapped.
-		return fmt.Errorf("callback function failed for S3 keyset '%s': %w", s.objectKey, err)
+	slog.Debug("S3Store: ForEachKeyset called", "bucket", s.bucket, "prefix", s.prefix)
+
+	var continuationToken *string
+
+	for {
+		// List objects with pagination
+		listInput := &s3.ListObjectsV2Input{
+			Bucket:            aws.String(s.bucket),
+			ContinuationToken: continuationToken,
+		}
+
+		// Add prefix if configured
+		if s.prefix != "" {
+			listInput.Prefix = aws.String(s.prefix)
+		}
+
+		objs, err := s.s3Client.ListObjectsV2(ctx, listInput)
+		if err != nil {
+			return fmt.Errorf("failed to list objects in bucket %s: %w", s.bucket, err)
+		}
+
+		// Process each object in this page
+		for _, obj := range objs.Contents {
+			if obj.Key == nil {
+				continue // Skip objects without keys
+			}
+
+			// Extract keyset name from the object key
+			keysetName := *obj.Key
+
+			// Remove prefix from keyset name if it exists
+			if s.prefix != "" && len(keysetName) > len(s.prefix) {
+				// Remove the prefix and any leading slash
+				keysetName = keysetName[len(s.prefix):]
+				if len(keysetName) > 0 && keysetName[0] == '/' {
+					keysetName = keysetName[1:]
+				}
+			}
+
+			// Skip empty keyset names
+			if keysetName == "" {
+				continue
+			}
+
+			// Call the callback function
+			if err := fn(keysetName); err != nil {
+				return fmt.Errorf("callback function failed for S3 keyset '%s': %w", keysetName, err)
+			}
+		}
+
+		// Check if there are more pages
+		if objs.IsTruncated == nil || !*objs.IsTruncated {
+			break
+		}
+
+		// Set continuation token for next page
+		continuationToken = objs.NextContinuationToken
 	}
+
 	return nil
+}
+
+func (s *S3Store) objectKey(keysetName string) string {
+	p := s.prefix
+	if p == "" {
+		return keysetName
+	}
+	if p[len(p)-1] != '/' {
+		p += "/"
+	}
+	return fmt.Sprintf("%s%s", p, keysetName)
 }
