@@ -95,15 +95,13 @@ CREATE TABLE IF NOT EXISTS %s (
 // Uses '?' for most dialects and '$1', '$2', etc. for PostgreSQL.
 func rebind(dialect string, query string) string {
 	if dialect == "postgres" {
-		q := []byte(query)
-		n := 0
-		for i := 0; i < len(q); i++ {
-			if q[i] == '?' {
-				n++
-				q = append(q[:i], append([]byte(fmt.Sprintf("$%d", n)), q[i+1:]...)...)
-			}
-		}
-		return string(q)
+		var n int
+		re := regexp.MustCompile(`\?`)
+		query = re.ReplaceAllStringFunc(query, func(_ string) string {
+			n++
+			return fmt.Sprintf("$%d", n)
+		})
+		return query
 	}
 	// Keep '?' for other dialects (like sqlite, mysql)
 	return query
