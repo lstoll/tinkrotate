@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
+	"regexp"
 
 	tinkrotatev1 "github.com/lstoll/tinkrotate/proto/tinkrotate/v1"
 	"github.com/tink-crypto/tink-go/v2/insecurecleartextkeyset"
@@ -18,13 +18,21 @@ import (
 
 var _ ManagedStore = (*SQLStore)(nil)
 
+type SQLDialect int
+
+const (
+	SQLDialectSQLite SQLDialect = iota + 1
+	SQLDialectMySQL
+	SQLDialectPostgreSQL
+)
+
 // SQLStore implements the Store interface using a relational database via database/sql.
 // It assumes a simple schema with one row per managed keyset.
 type SQLStore struct {
 	db        *sql.DB
 	kek       tink.AEAD // Optional: Key-Encryption-Key for encrypting the keyset handle data
 	tableName string    // Name of the database table
-	dialect   string    // SQL dialect (e.g., "sqlite", "mysql", "postgres")
+	dialect   SQLDialect
 }
 
 // SQLStoreOptions holds configuration options for SQLStore.
@@ -35,7 +43,7 @@ type SQLStoreOptions struct {
 	TableName string
 	// Dialect specifies the SQL dialect (e.g., "sqlite", "mysql", "postgres").
 	// Defaults to "sqlite" if empty.
-	Dialect string
+	Dialect SQLDialect
 }
 
 // NewSQLStore creates a new SQLStore instance.
@@ -48,8 +56,8 @@ func NewSQLStore(db *sql.DB, opts *SQLStoreOptions) (*SQLStore, error) {
 
 	s := &SQLStore{
 		db:        db,
-		tableName: "tink_keysets", // Default table name
-		dialect:   "sqlite",       // Default dialect
+		tableName: "tink_keysets",   // Default table name
+		dialect:   SQLDialectSQLite, // Default dialect
 	}
 
 	if opts != nil {
@@ -59,8 +67,8 @@ func NewSQLStore(db *sql.DB, opts *SQLStoreOptions) (*SQLStore, error) {
 		if opts.KEK != nil {
 			s.kek = opts.KEK
 		}
-		if opts.Dialect != "" {
-			s.dialect = strings.ToLower(opts.Dialect)
+		if opts.Dialect != SQLDialect(0) {
+			s.dialect = opts.Dialect
 		}
 	}
 
@@ -71,12 +79,11 @@ func NewSQLStore(db *sql.DB, opts *SQLStoreOptions) (*SQLStore, error) {
 	return s, nil
 }
 
-// Schema returns a basic schema suggestion for the table used by SQLStore.
-// Adjust types (BLOB, INTEGER) based on your specific SQL dialect.
-// The 'id' column stores the unique keysetName.
+// Schema returns a basic schema suggestion for the table used by SQLStore. The
+// 'id' column stores the unique keysetName.
 func (s *SQLStore) Schema() string {
 	dataType := "BLOB"
-	if s.dialect == "postgres" {
+	if s.dialect == SQLDialectPostgreSQL {
 		dataType = "BYTEA"
 	}
 
@@ -93,8 +100,8 @@ CREATE TABLE IF NOT EXISTS %s (
 
 // rebind replaces the SQL query's parameter placeholders based on the dialect.
 // Uses '?' for most dialects and '$1', '$2', etc. for PostgreSQL.
-func rebind(dialect string, query string) string {
-	if dialect == "postgres" {
+func rebind(dialect SQLDialect, query string) string {
+	if dialect == SQLDialectPostgreSQL {
 		var n int
 		re := regexp.MustCompile(`\?`)
 		query = re.ReplaceAllStringFunc(query, func(_ string) string {
