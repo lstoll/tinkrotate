@@ -9,12 +9,12 @@ import (
 	"log/slog"
 	"regexp"
 
-	"github.com/lstoll/tinkrotate"
-	tinkrotatev1 "github.com/lstoll/tinkrotate/proto/tinkrotate/v1"
 	"github.com/tink-crypto/tink-go/v2/insecurecleartextkeyset"
 	"github.com/tink-crypto/tink-go/v2/keyset"
 	"github.com/tink-crypto/tink-go/v2/tink"
 	"google.golang.org/protobuf/proto"
+	"lds.li/tinkrotate"
+	tinkrotatev1 "lds.li/tinkrotate/proto/tinkrotate/v1"
 )
 
 var _ tinkrotate.ManagedStore = (*SQLStore)(nil)

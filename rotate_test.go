@@ -11,12 +11,12 @@ import (
 	// "github.com/stretchr/testify/require" // Removed
 	"log/slog"
 
-	tinkrotatev1 "github.com/lstoll/tinkrotate/proto/tinkrotate/v1"
 	"github.com/tink-crypto/tink-go/v2/aead"
 	"github.com/tink-crypto/tink-go/v2/keyset" // Keep for cloning
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	tinkrotatev1 "lds.li/tinkrotate/proto/tinkrotate/v1"
 )
 
 // testWriter is a simple io.Writer that writes to t.Logf.

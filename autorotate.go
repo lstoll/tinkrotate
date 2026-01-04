@@ -8,12 +8,12 @@ import (
 	"sync"
 	"time"
 
-	tinkrotatev1 "github.com/lstoll/tinkrotate/proto/tinkrotate/v1"
 	"github.com/tink-crypto/tink-go/v2/keyset"
 	tinkpb "github.com/tink-crypto/tink-go/v2/proto/tink_go_proto"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	tinkrotatev1 "lds.li/tinkrotate/proto/tinkrotate/v1"
 )
 
 var ErrKeysetExists = errors.New("keyset already exists")

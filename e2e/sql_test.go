@@ -7,8 +7,8 @@ import (
 
 	_ "github.com/go-sql-driver/mysql" // Import the mysql driver
 	_ "github.com/jackc/pgx/v5/stdlib" // Import the pgx driver for PostgreSQL
-	"github.com/lstoll/tinkrotate/sqlstore"
-	_ "github.com/mattn/go-sqlite3" // Import the sqlite3 driver
+	_ "github.com/mattn/go-sqlite3"    // Import the sqlite3 driver
+	"lds.li/tinkrotate/sqlstore"
 )
 
 func TestAutoRotator_SQLite_BlackBox(t *testing.T) {

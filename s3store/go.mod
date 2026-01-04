@@ -1,10 +1,10 @@
-module github.com/lstoll/tinkrotate/s3store
+module lds.li/tinkrotate/s3store
 
 go 1.24.0
 
-require github.com/lstoll/tinkrotate v0.0.0
+require lds.li/tinkrotate v0.0.0
 
-replace github.com/lstoll/tinkrotate => ../
+replace lds.li/tinkrotate => ../
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.36.3

@@ -8,10 +8,10 @@ import (
 	"sort"
 	"time"
 
-	tinkrotatev1 "github.com/lstoll/tinkrotate/proto/tinkrotate/v1"
 	"github.com/tink-crypto/tink-go/v2/keyset"
 	tinkpb "github.com/tink-crypto/tink-go/v2/proto/tink_go_proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	tinkrotatev1 "lds.li/tinkrotate/proto/tinkrotate/v1"
 )
 
 // ValidateRotationPolicy checks if the provided policy has valid durations.
@@ -289,10 +289,10 @@ func (r *rotator) handlePromotions() error {
 		if r.primaryKey.Metadata == nil {
 			return nil
 		}
-		
+
 		var expectedEndTime time.Time
 		expired := false
-		
+
 		if r.primaryKey.Metadata.PromotionTime != nil {
 			expectedEndTime = r.primaryKey.Metadata.PromotionTime.AsTime().Add(primaryDuration)
 			if !r.now.Before(expectedEndTime) {
@@ -310,7 +310,7 @@ func (r *rotator) handlePromotions() error {
 				if pendingKey.Metadata == nil || pendingKey.Metadata.CreationTime == nil {
 					continue
 				}
-				
+
 				tinkKeyInfo, err := findTinkKeyInfo(r.manager, pendingKey.KeyID)
 				if err != nil || tinkKeyInfo.GetStatus() != tinkpb.KeyStatusType_ENABLED {
 					continue
@@ -323,13 +323,13 @@ func (r *rotator) handlePromotions() error {
 						r.logger.Error("Failed to promote key.", "keyID", pendingKey.KeyID, "error", err)
 						continue
 					}
-					
+
 					r.primaryKey.Metadata.State = tinkrotatev1.KeyState_KEY_STATE_PHASING_OUT
 					pendingKey.Metadata.State = tinkrotatev1.KeyState_KEY_STATE_PRIMARY
 					pendingKey.Metadata.PromotionTime = timestamppb.New(r.now)
-					
+
 					r.updated = true
-					// Update primaryKey pointer for subsequent logic if needed, 
+					// Update primaryKey pointer for subsequent logic if needed,
 					// but for now just breaking is fine as we only promote one per cycle.
 					return nil
 				}
@@ -363,21 +363,21 @@ func (r *rotator) handleKeyGeneration() error {
 	// Re-check primary/pending status from the manager because promotions might have happened.
 	// But actually, we only updated metadata in memory.
 	// The logic: "If primaryKey != nil && !hasPending"
-	
+
 	// We need to know if there is *currently* a pending key.
 	// We can check our r.pendingKeys list.
 	// BUT, if we just promoted a pending key to primary, it is no longer pending.
 	// So we need to re-evaluate based on the *current* state of metadata in `r`.
-	
+
 	hasPending := false
 	hasPrimary := false
-	
+
 	// Scan our tracked keys to see their current (possibly updated) state
 	allKeys := append([]*KeyInfo{}, r.primaryKey) // Primary might be nil
 	allKeys = append(allKeys, r.pendingKeys...)
 	allKeys = append(allKeys, r.phasingOutKeys...)
 	allKeys = append(allKeys, r.disabledKeys...)
-	
+
 	for _, k := range allKeys {
 		if k == nil || k.Metadata == nil {
 			continue
@@ -396,7 +396,7 @@ func (r *rotator) handleKeyGeneration() error {
 		if err != nil {
 			return fmt.Errorf("failed to add new key: %w", err)
 		}
-		
+
 		newMeta := &tinkrotatev1.KeyMetadata{
 			KeyId:        keyID,
 			State:        tinkrotatev1.KeyState_KEY_STATE_PENDING,
@@ -406,10 +406,9 @@ func (r *rotator) handleKeyGeneration() error {
 		r.updated = true
 		r.logger.Info("Generated new PENDING key.", "keyID", keyID)
 	}
-	
+
 	return nil
 }
-
 
 // Helper to find Tink KeyInfo within a manager/handle
 func findTinkKeyInfo(m *keyset.Manager, keyID uint32) (*tinkpb.KeysetInfo_KeyInfo, error) {
@@ -449,7 +448,7 @@ func CheckConsistency(handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationM
 		}
 		return inconsistencies
 	}
-	
+
 	if metadata.RotationPolicy == nil && len(ksInfo.GetKeyInfo()) > 0 {
 		inconsistencies = append(inconsistencies, errors.New("metadata.RotationPolicy is nil"))
 	}
@@ -475,7 +474,7 @@ func CheckConsistency(handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationM
 			inconsistencies = append(inconsistencies, fmt.Errorf("key ID %d missing from metadata", kID))
 		}
 	}
-	
+
 	for kID := range metadataKeyIDs {
 		if _, exists := tinkKeyIDs[kID]; !exists {
 			inconsistencies = append(inconsistencies, fmt.Errorf("metadata key ID %d missing from keyset", kID))

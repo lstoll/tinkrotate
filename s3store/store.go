@@ -13,9 +13,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	awshttp "github.com/aws/smithy-go/transport/http"
-	"github.com/lstoll/tinkrotate"
-	tinkrotatev1 "github.com/lstoll/tinkrotate/proto/tinkrotate/v1"
 	"google.golang.org/protobuf/proto"
+	"lds.li/tinkrotate"
+	tinkrotatev1 "lds.li/tinkrotate/proto/tinkrotate/v1"
 
 	"github.com/tink-crypto/tink-go/v2/insecurecleartextkeyset"
 	"github.com/tink-crypto/tink-go/v2/keyset"

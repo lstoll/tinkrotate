@@ -1,4 +1,4 @@
-module github.com/lstoll/tinkrotate
+module lds.li/tinkrotate
 
 go 1.24.0
 

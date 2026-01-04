@@ -1,17 +1,17 @@
-module github.com/lstoll/tinkrotate/e2e
+module lds.li/tinkrotate/e2e
 
 go 1.24.0
 
 toolchain go1.24.2
 
 require (
-	github.com/lstoll/tinkrotate v0.0.0
-	github.com/lstoll/tinkrotate/s3store v0.0.0
+	lds.li/tinkrotate v0.0.0
+	lds.li/tinkrotate/s3store v0.0.0
 )
 
-replace github.com/lstoll/tinkrotate => ../
+replace lds.li/tinkrotate => ../
 
-replace github.com/lstoll/tinkrotate/s3store => ../s3store
+replace lds.li/tinkrotate/s3store => ../s3store
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.36.3

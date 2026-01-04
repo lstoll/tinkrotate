@@ -342,7 +342,7 @@ const file_tinkrotate_v1_tinkrotate_proto_rawDesc = "" +
 	"\x11KEY_STATE_PENDING\x10\x01\x12\x15\n" +
 	"\x11KEY_STATE_PRIMARY\x10\x02\x12\x19\n" +
 	"\x15KEY_STATE_PHASING_OUT\x10\x03\x12\x16\n" +
-	"\x12KEY_STATE_DISABLED\x10\x04B?Z=github.com/lstoll/tinkrotate/proto/tinkrotate/v1;tinkrotatev1b\x06proto3"
+	"\x12KEY_STATE_DISABLED\x10\x04B?Z=lds.li/tinkrotate/proto/tinkrotate/v1;tinkrotatev1b\x06proto3"
 
 var (
 	file_tinkrotate_v1_tinkrotate_proto_rawDescOnce sync.Once
