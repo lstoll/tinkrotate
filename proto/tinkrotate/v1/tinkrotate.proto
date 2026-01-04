@@ -6,7 +6,7 @@ import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 import "google/crypto/tink/tink.proto";
 
-option go_package = "github.com/lstoll/tinkrotate/proto/tinkrotate/v1;tinkrotatev1";
+option go_package = "lds.li/tinkrotate/proto/tinkrotate/v1;tinkrotatev1";
 
 // KeyState defines the lifecycle state of a key within the rotation policy.
 enum KeyState {

@@ -7,8 +7,8 @@ import (
 
 	_ "github.com/go-sql-driver/mysql" // Import the mysql driver
 	_ "github.com/jackc/pgx/v5/stdlib" // Import the pgx driver for PostgreSQL
-	"github.com/lstoll/tinkrotate"
-	_ "github.com/mattn/go-sqlite3" // Import the sqlite3 driver
+	_ "github.com/mattn/go-sqlite3"    // Import the sqlite3 driver
+	"lds.li/tinkrotate/sqlstore"
 )
 
 func TestAutoRotator_SQLite_BlackBox(t *testing.T) {
@@ -23,7 +23,7 @@ func TestAutoRotator_SQLite_BlackBox(t *testing.T) {
 
 	// --- Store Setup ---
 	// Pass nil for options to use defaults (table name = "tink_keysets", no KEK)
-	sqlStore, err := tinkrotate.NewSQLStore(db, &tinkrotate.SQLStoreOptions{Dialect: tinkrotate.SQLDialectSQLite})
+	sqlStore, err := sqlstore.NewSQLStore(db, &sqlstore.SQLStoreOptions{Dialect: sqlstore.SQLDialectSQLite})
 	if err != nil {
 		t.Fatalf("Failed to create SQLStore: %v", err)
 	}
@@ -52,7 +52,7 @@ func TestAutoRotator_MySQL_BlackBox(t *testing.T) {
 	defer db.Close()
 
 	// --- Store Setup ---
-	sqlStore, err := tinkrotate.NewSQLStore(db, &tinkrotate.SQLStoreOptions{Dialect: tinkrotate.SQLDialectMySQL})
+	sqlStore, err := sqlstore.NewSQLStore(db, &sqlstore.SQLStoreOptions{Dialect: sqlstore.SQLDialectMySQL})
 	if err != nil {
 		t.Fatalf("Failed to create SQLStore: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestAutoRotator_Postgres_BlackBox(t *testing.T) {
 	defer db.Close()
 
 	// --- Store Setup ---
-	sqlStore, err := tinkrotate.NewSQLStore(db, &tinkrotate.SQLStoreOptions{Dialect: tinkrotate.SQLDialectPostgreSQL})
+	sqlStore, err := sqlstore.NewSQLStore(db, &sqlstore.SQLStoreOptions{Dialect: sqlstore.SQLDialectPostgreSQL})
 	if err != nil {
 		t.Fatalf("Failed to create SQLStore: %v", err)
 	}

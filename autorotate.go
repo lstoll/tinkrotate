@@ -8,47 +8,36 @@ import (
 	"sync"
 	"time"
 
-	tinkrotatev1 "github.com/lstoll/tinkrotate/proto/tinkrotate/v1"
 	"github.com/tink-crypto/tink-go/v2/keyset"
 	tinkpb "github.com/tink-crypto/tink-go/v2/proto/tink_go_proto"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	tinkrotatev1 "lds.li/tinkrotate/proto/tinkrotate/v1"
 )
 
-// ErrKeysetExists indicates that an attempt was made to provision a keyset that already exists.
 var ErrKeysetExists = errors.New("keyset already exists")
-
-// ErrRotationPolicyMissing indicates the metadata lacks a required rotation policy.
 var ErrRotationPolicyMissing = errors.New("rotation policy missing in metadata")
 
-// AutoRotatorOpts provides optional configuration for the AutoRotator.
 type AutoRotatorOpts struct {
 	// ProvisionPolicies specifies a map of keyset names to their desired rotation
 	// policies. If a keyset name listed here does not exist in the store when
 	// RunOnce executes, the AutoRotator will attempt to provision it using the
 	// provided policy.
 	ProvisionPolicies map[string]*tinkrotatev1.RotationPolicy
-
-	// Logger allows providing a custom slog logger. If nil, a default logger
-	// with the attribute "component"="autorotator" will be used.
-	Logger *slog.Logger
-
-	// TimeSource allows providing a custom time source. If nil, time.Now is used.
-	TimeSource func() time.Time
+	Logger            *slog.Logger
+	TimeSource        func() time.Time
 }
 
 // AutoRotator manages the lifecycle of Tink keysets within a store, performing
 // automatic rotation based on a schedule and the policies defined within each keyset's metadata.
-// It can also ensure specific keysets are provisioned if they don't exist.
 type AutoRotator struct {
 	store             ManagedStore
 	checkInterval     time.Duration
-	now               func() time.Time                        // Allow mocking time
-	provisionPolicies map[string]*tinkrotatev1.RotationPolicy // Store policies to provision
-	logger            *slog.Logger                            // Structured logger
+	now               func() time.Time
+	provisionPolicies map[string]*tinkrotatev1.RotationPolicy
+	logger            *slog.Logger
 
-	// Background routine management
 	mu         sync.Mutex
 	running    bool
 	stopChan   chan struct{}
@@ -56,10 +45,6 @@ type AutoRotator struct {
 	cancelCtx  context.CancelFunc
 }
 
-// NewAutoRotator creates a new AutoRotator.
-// store: The persistence layer implementation.
-// checkInterval: How often to check if rotation is needed.
-// opts: Optional configuration, including policies for keysets to provision.
 func NewAutoRotator(store ManagedStore, checkInterval time.Duration, opts *AutoRotatorOpts) (*AutoRotator, error) {
 	if store == nil {
 		return nil, errors.New("store cannot be nil")
@@ -105,43 +90,33 @@ func NewAutoRotator(store ManagedStore, checkInterval time.Duration, opts *AutoR
 }
 
 // RunOnce performs a single check-and-rotate cycle for all keysets found in the store.
-// It iterates through each keyset name provided by store.ForEachKeyset.
-// It reads each keyset, applies the rotation logic defined in its *own* metadata,
-// and writes back if changes occurred.
-// After processing existing keysets, it checks the keys specified in ProvisionPolicies
-// (from opts) and attempts to provision any that do not exist in the store.
 func (ar *AutoRotator) RunOnce(ctx context.Context) error {
 	ar.logger.Info("Starting rotation check cycle")
 	var firstError error
-	processedKeys := make(map[string]struct{}) // Track keys processed by ForEachKeyset
+	processedKeys := make(map[string]struct{})
 
-	// 1. Process existing keys found in the store
 	err := ar.store.ForEachKeyset(ctx, func(keysetName string) error {
 		processedKeys[keysetName] = struct{}{}
 		runErr := ar.processSingleKeyset(ctx, keysetName)
 		if runErr != nil {
 			ar.logger.Error("Error processing keyset", "keyset_name", keysetName, "error", runErr)
 			if firstError == nil {
-				// Capture the first error encountered during rotation of existing keys
 				firstError = fmt.Errorf("error processing keyset '%s': %w", keysetName, runErr)
 			}
 		}
-		return nil // Continue iteration even if one keyset fails
+		return nil
 	})
 
 	if err != nil {
-		// This error comes from ForEachKeyset itself (e.g., failed DB connection)
 		errorMsg := "Failed iterating keysets in store"
 		if firstError == nil {
 			firstError = fmt.Errorf("%s: %w", errorMsg, err)
 			ar.logger.Error(errorMsg, "error", err)
 		} else {
-			// Log this error too, but prioritize the error from processSingleKeyset
 			ar.logger.Error(errorMsg, "error", err, "prior_error", firstError)
 		}
 	}
 
-	// 2. Process keys specified for provisioning if they weren't already processed
 	if len(ar.provisionPolicies) > 0 {
 		for keysetName, policy := range ar.provisionPolicies {
 			if _, alreadyProcessed := processedKeys[keysetName]; alreadyProcessed {
@@ -152,26 +127,22 @@ func (ar *AutoRotator) RunOnce(ctx context.Context) error {
 			_, readErr := ar.store.ReadKeysetAndMetadata(ctx, keysetName)
 
 			if readErr == nil {
-				// Keyset exists unexpectedly (ForEachKeyset might be inconsistent or timing issue)
 				ar.logger.Warn("Specified keyset found unexpectedly, skipping provisioning", "keyset_name", keysetName)
 				continue
 			}
 
 			if errors.Is(readErr, ErrKeysetNotFound) {
-				// Keyset does not exist, attempt to provision it
 				ar.logger.Info("Attempting to provision specified keyset", "keyset_name", keysetName)
 				provisionErr := ar.ProvisionKeyset(ctx, keysetName, policy)
 				if provisionErr != nil {
 					ar.logger.Error("Failed to provision specified keyset", "keyset_name", keysetName, "error", provisionErr)
 					if firstError == nil {
-						// Capture the first provisioning error
 						firstError = fmt.Errorf("failed to provision specified keyset '%s': %w", keysetName, provisionErr)
 					}
 				} else {
 					ar.logger.Info("Successfully provisioned specified keyset", "keyset_name", keysetName)
 				}
 			} else {
-				// Another error occurred trying to read the keyset
 				ar.logger.Error("Error checking existence of specified keyset for provisioning", "keyset_name", keysetName, "error", readErr)
 				if firstError == nil {
 					firstError = fmt.Errorf("error checking existence of specified keyset '%s': %w", keysetName, readErr)
@@ -181,26 +152,20 @@ func (ar *AutoRotator) RunOnce(ctx context.Context) error {
 	}
 
 	ar.logger.Info("Finished rotation check cycle")
-	return firstError // Return the first error encountered, if any
+	return firstError
 }
 
-// processSingleKeyset handles the read, rotate, and write logic for one keyset.
-// It expects the keyset to exist and have valid metadata including a rotation policy.
 func (ar *AutoRotator) processSingleKeyset(ctx context.Context, keysetName string) error {
 	readResult, err := ar.store.ReadKeysetAndMetadata(ctx, keysetName)
 
 	if err != nil {
 		if errors.Is(err, ErrKeysetNotFound) {
-			// This should ideally not happen if ForEachKeyset is consistent,
-			// but handle it gracefully. RunOnce doesn't provision.
 			ar.logger.Warn("Keyset not found during processing (skipped)", "keyset_name", keysetName)
 			return nil
 		}
-		// Other read errors are fatal for this keyset
 		return fmt.Errorf("failed to read from store for keyset '%s': %w", keysetName, err)
 	}
 
-	// --- Keyset Exists ---
 	currentHandle := readResult.Handle
 	currentMetadata := readResult.Metadata
 	currentContext := readResult.Context
@@ -211,23 +176,18 @@ func (ar *AutoRotator) processSingleKeyset(ctx context.Context, keysetName strin
 	if currentMetadata == nil {
 		return fmt.Errorf("store returned nil metadata for existing keyset '%s'", keysetName)
 	}
-	// A valid policy is required for rotation
 	if currentMetadata.RotationPolicy == nil {
 		ar.logger.Warn("Skipping keyset because metadata lacks a RotationPolicy", "keyset_name", keysetName)
 		return ErrRotationPolicyMissing
 	}
-	// Validate the policy structure itself (durations, template presence)
 	if err := ValidateRotationPolicy(currentMetadata.RotationPolicy); err != nil {
 		ar.logger.Error("Skipping keyset due to invalid RotationPolicy", "keyset_name", keysetName, "error", err)
 		return fmt.Errorf("invalid rotation policy for keyset '%s': %w", keysetName, err)
 	}
 
-	// Clone the original metadata *before* passing it to the rotator function
 	originalMetadataClone := proto.Clone(currentMetadata)
-	// Clone the original keyset info for comparison
 	originalKeysetInfoClone := proto.Clone(currentHandle.KeysetInfo())
 
-	// Use the AutoRotator's time source
 	newHandle, newMetadata, rotated, rotationErr := RotateKeyset(currentHandle, currentMetadata, &RotateOpts{
 		TimeSource: func() time.Time {
 			return ar.now()
@@ -236,23 +196,18 @@ func (ar *AutoRotator) processSingleKeyset(ctx context.Context, keysetName strin
 	})
 
 	if rotationErr != nil {
-		// Log the error but return it, allowing RunOnce to continue with other keysets
 		ar.logger.Error("Rotation logic failed for keyset", "keyset_name", keysetName, "error", rotationErr)
 		return fmt.Errorf("rotation logic failed for keyset '%s': %w", keysetName, rotationErr)
 	}
 
-	// --- Check if Changes Occurred ---
 	// Note: RotateKeyset now returns the *original* handle/metadata if no error occurred AND no changes were needed.
 	// We still need to compare the returned objects with the originals.
 	metadataChanged := !proto.Equal(originalMetadataClone, newMetadata)
 	keysetChanged := !proto.Equal(originalKeysetInfoClone, newHandle.KeysetInfo())
 
-	// --- Write Back to Store (Only If Changed) ---
 	if !rotated {
-		// Sanity check: if RotateKeyset reports no changes, our deep comparison should also find no changes.
 		if metadataChanged || keysetChanged {
 			ar.logger.Warn("RotateKeyset reported no rotation, but proto.Equal detected changes. This indicates a discrepancy.", "keyset_name", keysetName, "metadata_changed_by_equal", metadataChanged, "keyset_changed_by_equal", keysetChanged)
-			// Proceed to write anyway if proto.Equal detected changes, as that's the more robust check.
 		} else {
 			return nil
 		}
@@ -265,10 +220,8 @@ func (ar *AutoRotator) processSingleKeyset(ctx context.Context, keysetName strin
 	if writeErr != nil {
 		if errors.Is(writeErr, ErrOptimisticLockFailed) {
 			ar.logger.Warn("Optimistic lock failed during write, another process may have updated concurrently", "keyset_name", keysetName)
-			// Treat lock failure as non-fatal for this specific keyset, let next cycle retry
 			return nil
 		}
-		// Other write errors are fatal for this keyset cycle
 		ar.logger.Error("Failed to write updated state to store", "keyset_name", keysetName, "error", writeErr)
 		return fmt.Errorf("failed to write updated state to store for keyset '%s': %w", keysetName, writeErr)
 	}
@@ -278,7 +231,6 @@ func (ar *AutoRotator) processSingleKeyset(ctx context.Context, keysetName strin
 }
 
 // Start begins the background rotation routine.
-// It periodically calls RunOnce to process all existing keysets.
 func (ar *AutoRotator) Start(ctx context.Context) {
 	ar.mu.Lock()
 	if ar.running {
@@ -341,11 +293,11 @@ func (ar *AutoRotator) Stop() {
 	if ar.cancelCtx != nil {
 		ar.cancelCtx()
 	}
-	ar.mu.Unlock() // Unlock before waiting
+	ar.mu.Unlock()
 
 	ar.logger.Info("Waiting for background routine to shut down")
 	ar.shutdownWg.Wait()
-	ar.mu.Lock() // Re-acquire lock to safely update running status
+	ar.mu.Lock()
 	ar.running = false
 	ar.cancelCtx = nil
 	ar.mu.Unlock()
@@ -353,39 +305,28 @@ func (ar *AutoRotator) Stop() {
 }
 
 // ProvisionKeyset explicitly provisions a new keyset with the given name and rotation policy.
-// The provided policy (including key template and durations) will be embedded in the
-// keyset's metadata.
 // It returns ErrKeysetExists if a keyset with that name already exists.
-// It returns an error if the policy is invalid or if there are errors during key
-// generation or writing to the store.
 func (ar *AutoRotator) ProvisionKeyset(ctx context.Context, keysetName string, policy *tinkrotatev1.RotationPolicy) error {
 	logger := ar.logger.With("keyset_name", keysetName)
 	logger.Info("Attempting explicit provisioning")
 
-	// 1. Validate the provided policy first
 	if err := ValidateRotationPolicy(policy); err != nil {
 		logger.Error("Provisioning failed: Invalid policy provided", "error", err)
 		return fmt.Errorf("invalid rotation policy provided for provisioning: %w", err)
 	}
 
-	// 2. Check if keyset already exists
 	readResult, err := ar.store.ReadKeysetAndMetadata(ctx, keysetName)
 	if err == nil && readResult != nil {
-		// Keyset found, return specific error
 		logger.Warn("Provisioning failed: Keyset already exists", "error", ErrKeysetExists)
 		return ErrKeysetExists
 	}
 	if !errors.Is(err, ErrKeysetNotFound) {
-		// An unexpected error occurred during the read check
 		logger.Error("Provisioning failed: Error checking existence", "error", err)
 		return fmt.Errorf("failed to check store for keyset '%s': %w", keysetName, err)
 	}
-	// err is ErrKeysetNotFound, proceed
 
-	// 3. Get key template from the provided policy
-	keyTemplate := policy.KeyTemplate // Already validated policy ensures this isn't nil
+	keyTemplate := policy.KeyTemplate
 
-	// 4. Generate initial keyset handle
 	manager := keyset.NewManager()
 	keyID, err := manager.Add(keyTemplate)
 	if err != nil {
@@ -407,7 +348,6 @@ func (ar *AutoRotator) ProvisionKeyset(ctx context.Context, keysetName string, p
 		return err
 	}
 
-	// 5. Create initial metadata, embedding the *provided policy*
 	now := ar.now()
 	metadata := &tinkrotatev1.KeyRotationMetadata{
 		RotationPolicy: policy,
@@ -421,7 +361,6 @@ func (ar *AutoRotator) ProvisionKeyset(ctx context.Context, keysetName string, p
 		},
 	}
 
-	// Run a rotate to ensure pending keys are provisioned
 	handle, metadata, _, err = RotateKeyset(handle, metadata, &RotateOpts{
 		TimeSource: ar.now,
 		Logger:     ar.logger,
@@ -431,12 +370,10 @@ func (ar *AutoRotator) ProvisionKeyset(ctx context.Context, keysetName string, p
 		return fmt.Errorf("failed to rotate provisioned keyset: %w", err)
 	}
 
-	// 6. Write to store (expecting nil context for initial write)
 	logger.Info("Writing newly provisioned keyset to store")
 	writeErr := ar.store.WriteKeysetAndMetadata(ctx, keysetName, handle, metadata, nil)
 	if writeErr != nil {
 		logger.Error("Failed to write provisioned keyset to store", "error", writeErr)
-		// Potentially check for specific store errors like "already exists" if the initial read raced.
 		return fmt.Errorf("failed to write initial state to store for keyset '%s': %w", keysetName, writeErr)
 	}
 
@@ -444,9 +381,8 @@ func (ar *AutoRotator) ProvisionKeyset(ctx context.Context, keysetName string, p
 	return nil
 }
 
-// Helper function to create a default rotation policy for convenience
-// (e.g., for tests or simple provisioning)
-// NOTE: Users should carefully choose their templates and durations.
+// CreateDefaultPolicy creates a default rotation policy for convenience.
+// Users should carefully choose their templates and durations.
 func CreateDefaultPolicy(template *tinkpb.KeyTemplate) *tinkrotatev1.RotationPolicy {
 	return &tinkrotatev1.RotationPolicy{
 		KeyTemplate:         template,

@@ -8,10 +8,10 @@ import (
 	"sort"
 	"time"
 
-	tinkrotatev1 "github.com/lstoll/tinkrotate/proto/tinkrotate/v1"
 	"github.com/tink-crypto/tink-go/v2/keyset"
 	tinkpb "github.com/tink-crypto/tink-go/v2/proto/tink_go_proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	tinkrotatev1 "lds.li/tinkrotate/proto/tinkrotate/v1"
 )
 
 // ValidateRotationPolicy checks if the provided policy has valid durations.
@@ -46,10 +46,7 @@ type RotateOpts struct {
 }
 
 // RotateKeyset performs one rotation cycle based on the provided current time.
-// It reads the rotation policy *from the metadata* itself.
-// It takes the current keyset handle and its corresponding metadata,
-// applies the rotation policy, and returns the potentially modified
-// keyset handle and updated metadata.
+// It reads the rotation policy from the metadata itself.
 // The caller is responsible for persisting the returned handle and metadata.
 func RotateKeyset(
 	handle *keyset.Handle,
@@ -69,70 +66,97 @@ func RotateKeyset(
 		return nil, nil, false, errors.New("keyset handle cannot be nil")
 	}
 	if metadata == nil {
-		// If handle is not empty, require metadata
 		if len(handle.KeysetInfo().GetKeyInfo()) > 0 {
 			return nil, nil, false, errors.New("metadata cannot be nil for non-empty keyset")
 		}
-		// Allow nil metadata only if handle is also effectively empty/new
 		metadata = &tinkrotatev1.KeyRotationMetadata{}
 	}
-	// Ensure key metadata map exists even if policy is missing initially
 	if metadata.KeyMetadata == nil {
 		metadata.KeyMetadata = make(map[uint32]*tinkrotatev1.KeyMetadata)
 	}
-	// Get and validate the policy *from the metadata*
+
 	policy := metadata.RotationPolicy
 	if err := ValidateRotationPolicy(policy); err != nil {
 		return nil, nil, false, fmt.Errorf("invalid rotation policy in metadata: %w", err)
 	}
 
-	currentTime := time.Now()
-	if opts != nil && opts.TimeSource != nil {
-		currentTime = opts.TimeSource()
-	}
-
-	primaryDuration := policy.PrimaryDuration.AsDuration()
-	propagationTime := policy.PropagationTime.AsDuration()
-	phaseOutDuration := policy.PhaseOutDuration.AsDuration()
-	deletionGracePeriod := policy.DeletionGracePeriod.AsDuration()
-	keyTemplate := policy.KeyTemplate
-
 	inconsistencies := CheckConsistency(handle, metadata)
 	if len(inconsistencies) > 0 {
-		// Allow processing even with inconsistencies? For now, return error.
 		return nil, nil, false, fmt.Errorf("inconsistencies found before rotation: %v", inconsistencies)
 	}
 
-	manager := keyset.NewManagerFromHandle(handle)
-	ksInfo := handle.KeysetInfo()
-	updated := false // Track if any changes were made
+	r := &rotator{
+		handle:   handle,
+		metadata: metadata,
+		manager:  keyset.NewManagerFromHandle(handle),
+		opts:     opts,
+		logger:   logger,
+		policy:   policy,
+		now:      time.Now(),
+	}
 
-	keyInfos := make(map[uint32]*KeyInfo) // Map key ID to combined info
-	var primaryKey *KeyInfo
-	var pendingKeys []*KeyInfo
-	var phasingOutKeys []*KeyInfo
-	var disabledKeys []*KeyInfo
+	if opts != nil && opts.TimeSource != nil {
+		r.now = opts.TimeSource()
+	}
 
-	// Collect current keys and their metadata states
+	if err := r.init(); err != nil {
+		return nil, nil, false, err
+	}
+
+	if err := r.handleDeletions(); err != nil {
+		return nil, nil, false, err
+	}
+	if err := r.handlePhaseOut(); err != nil {
+		return nil, nil, false, err
+	}
+	if err := r.handlePromotions(); err != nil {
+		return nil, nil, false, err
+	}
+	if err := r.handleKeyGeneration(); err != nil {
+		return nil, nil, false, err
+	}
+
+	finalHandle := r.handle
+	var err error
+	if r.updated {
+		finalHandle, err = r.manager.Handle()
+		if err != nil {
+			return nil, nil, r.updated, fmt.Errorf("failed to get final handle: %w", err)
+		}
+	}
+
+	finalInconsistencies := CheckConsistency(finalHandle, metadata)
+	if len(finalInconsistencies) > 0 {
+		logger.Warn("Inconsistencies found after rotation attempt.", "inconsistencies", finalInconsistencies)
+	}
+
+	return finalHandle, metadata, r.updated, nil
+}
+
+type rotator struct {
+	handle   *keyset.Handle
+	metadata *tinkrotatev1.KeyRotationMetadata
+	manager  *keyset.Manager
+	opts     *RotateOpts
+	logger   *slog.Logger
+	policy   *tinkrotatev1.RotationPolicy
+	now      time.Time
+	updated  bool
+
+	primaryKey     *KeyInfo
+	pendingKeys    []*KeyInfo
+	phasingOutKeys []*KeyInfo
+	disabledKeys   []*KeyInfo
+}
+
+func (r *rotator) init() error {
+	ksInfo := r.handle.KeysetInfo()
 	for _, keyInfo := range ksInfo.GetKeyInfo() {
 		keyID := keyInfo.GetKeyId()
-		meta, metaExists := metadata.KeyMetadata[keyID]
-
-		if !metaExists {
-			logger.Warn("Key ID found in keyset but not in metadata. Skipping.", "keyID", keyID)
+		meta, exists := r.metadata.KeyMetadata[keyID]
+		if !exists {
+			r.logger.Warn("Key ID found in keyset but not in metadata. Skipping.", "keyID", keyID)
 			continue
-		}
-
-		currentState := meta.State
-		currentStatus := keyInfo.GetStatus()
-		if currentState == tinkrotatev1.KeyState_KEY_STATE_PRIMARY && currentStatus != tinkpb.KeyStatusType_ENABLED && keyInfo.GetOutputPrefixType() != tinkpb.OutputPrefixType_RAW { // Primary must be enabled (unless RAW key) - Tink enforces this via SetPrimary
-			logger.Warn("Key metadata state is PRIMARY, but Tink status is different.", "keyID", keyID, "tink_status", currentStatus)
-		}
-		if (currentState == tinkrotatev1.KeyState_KEY_STATE_PENDING || currentState == tinkrotatev1.KeyState_KEY_STATE_PHASING_OUT) && currentStatus != tinkpb.KeyStatusType_ENABLED {
-			logger.Warn("Key metadata state requires ENABLED Tink status, but found different.", "keyID", keyID, "metadata_state", currentState, "tink_status", currentStatus)
-		}
-		if currentState == tinkrotatev1.KeyState_KEY_STATE_DISABLED && currentStatus != tinkpb.KeyStatusType_DISABLED {
-			logger.Warn("Key metadata state is DISABLED, but Tink status is different.", "keyID", keyID, "tink_status", currentStatus)
 		}
 
 		ki := &KeyInfo{
@@ -140,356 +164,264 @@ func RotateKeyset(
 			Status:   keyInfo.GetStatus(),
 			Metadata: meta,
 		}
-		keyInfos[keyID] = ki
 
 		switch meta.State {
 		case tinkrotatev1.KeyState_KEY_STATE_PRIMARY:
-			if primaryKey != nil {
-				logger.Warn("Multiple keys marked as PRIMARY in metadata. Using first encountered.", "existing_primary_key_id", primaryKey.KeyID, "new_primary_key_id", ki.KeyID, "using_key_id", primaryKey.KeyID)
+			if r.primaryKey != nil {
+				r.logger.Warn("Multiple keys marked as PRIMARY in metadata. Using first encountered.", "existing_primary", r.primaryKey.KeyID, "new_primary", ki.KeyID)
 			} else {
-				primaryKey = ki
+				r.primaryKey = ki
 			}
 		case tinkrotatev1.KeyState_KEY_STATE_PENDING:
-			pendingKeys = append(pendingKeys, ki)
+			r.pendingKeys = append(r.pendingKeys, ki)
 		case tinkrotatev1.KeyState_KEY_STATE_PHASING_OUT:
-			phasingOutKeys = append(phasingOutKeys, ki)
+			r.phasingOutKeys = append(r.phasingOutKeys, ki)
 		case tinkrotatev1.KeyState_KEY_STATE_DISABLED:
-			disabledKeys = append(disabledKeys, ki)
+			r.disabledKeys = append(r.disabledKeys, ki)
 		}
 	}
 
-	sort.Slice(pendingKeys, func(i, j int) bool {
+	sort.Slice(r.pendingKeys, func(i, j int) bool {
 		t1 := time.Time{}
-		if pendingKeys[i].Metadata.CreationTime != nil {
-			t1 = pendingKeys[i].Metadata.CreationTime.AsTime()
+		if r.pendingKeys[i].Metadata.CreationTime != nil {
+			t1 = r.pendingKeys[i].Metadata.CreationTime.AsTime()
 		}
 		t2 := time.Time{}
-		if pendingKeys[j].Metadata.CreationTime != nil {
-			t2 = pendingKeys[j].Metadata.CreationTime.AsTime()
+		if r.pendingKeys[j].Metadata.CreationTime != nil {
+			t2 = r.pendingKeys[j].Metadata.CreationTime.AsTime()
 		}
 		return t1.Before(t2)
 	})
+	return nil
+}
 
+func (r *rotator) handleDeletions() error {
 	keysToDelete := []uint32{}
-	for _, ki := range disabledKeys {
+	for _, ki := range r.disabledKeys {
 		if ki.Metadata == nil || ki.Metadata.DeletionTime == nil {
-			logger.Warn("Disabled key missing metadata or deletion time. Skipping deletion check.", "keyID", ki.KeyID)
 			continue
 		}
 
-		if !currentTime.Before(ki.Metadata.DeletionTime.AsTime()) {
-			tinkKeyInfo, err := findTinkKeyInfo(manager, ki.KeyID)
+		if !r.now.Before(ki.Metadata.DeletionTime.AsTime()) {
+			tinkKeyInfo, err := findTinkKeyInfo(r.manager, ki.KeyID)
 			if err != nil {
-				logger.Warn("Could not find Tink info for key during deletion check. Skipping.", "keyID", ki.KeyID, "error", err)
 				continue
 			}
 
 			if tinkKeyInfo.GetStatus() != tinkpb.KeyStatusType_DESTROYED {
-				logger.Info("Deleting key (past deletion time).", "keyID", ki.KeyID, "deletion_time", ki.Metadata.DeletionTime.AsTime().Format(time.RFC3339))
-				err := manager.Delete(ki.KeyID)
-				if err != nil {
-					logger.Error("Failed to delete key.", "keyID", ki.KeyID, "error", err)
+				r.logger.Info("Deleting key (past deletion time).", "keyID", ki.KeyID)
+				if err := r.manager.Delete(ki.KeyID); err != nil {
+					r.logger.Error("Failed to delete key.", "keyID", ki.KeyID, "error", err)
 				} else {
 					keysToDelete = append(keysToDelete, ki.KeyID)
-					updated = true
+					r.updated = true
 				}
 			} else {
-				if _, exists := metadata.KeyMetadata[ki.KeyID]; exists {
-					keysToDelete = append(keysToDelete, ki.KeyID)
-					updated = true // Metadata changed
-				}
+				keysToDelete = append(keysToDelete, ki.KeyID)
+				r.updated = true
 			}
 		}
 	}
 	for _, keyID := range keysToDelete {
-		delete(metadata.KeyMetadata, keyID)
+		delete(r.metadata.KeyMetadata, keyID)
 	}
+	return nil
+}
 
-	for _, ki := range phasingOutKeys {
+func (r *rotator) handlePhaseOut() error {
+	phaseOutDuration := r.policy.PhaseOutDuration.AsDuration()
+	primaryDuration := r.policy.PrimaryDuration.AsDuration()
+	deletionGracePeriod := r.policy.DeletionGracePeriod.AsDuration()
+
+	for _, ki := range r.phasingOutKeys {
 		if ki.Metadata == nil {
-			logger.Warn("Phasing-out key missing metadata. Skipping disable check.", "keyID", ki.KeyID)
 			continue
 		}
 
-		disableTimeKnown := false
 		var expectedDisableTime time.Time
-		if primaryKey != nil && primaryKey.Metadata != nil && primaryKey.Metadata.PromotionTime != nil {
-			expectedDisableTime = primaryKey.Metadata.PromotionTime.AsTime().Add(phaseOutDuration)
+		disableTimeKnown := false
+
+		if r.primaryKey != nil && r.primaryKey.Metadata != nil && r.primaryKey.Metadata.PromotionTime != nil {
+			expectedDisableTime = r.primaryKey.Metadata.PromotionTime.AsTime().Add(phaseOutDuration)
 			disableTimeKnown = true
-		} else {
-			// Fallback: Use phasing-out key's own creation + primary duration + phase-out duration.
-			if ki.Metadata.CreationTime != nil {
-				expectedDisableTime = ki.Metadata.CreationTime.AsTime().Add(primaryDuration).Add(phaseOutDuration)
-				disableTimeKnown = true
-				logger.Info("Key using fallback disable time check.", "keyID", ki.KeyID)
-			} else {
-				logger.Warn("Phasing-out key missing creation time. Cannot determine disable time. Skipping.", "keyID", ki.KeyID)
-			}
+		} else if ki.Metadata.CreationTime != nil {
+			// Fallback
+			expectedDisableTime = ki.Metadata.CreationTime.AsTime().Add(primaryDuration).Add(phaseOutDuration)
+			disableTimeKnown = true
 		}
 
-		if disableTimeKnown && !currentTime.Before(expectedDisableTime) {
-			tinkKeyInfo, err := findTinkKeyInfo(manager, ki.KeyID)
+		if disableTimeKnown && !r.now.Before(expectedDisableTime) {
+			tinkKeyInfo, err := findTinkKeyInfo(r.manager, ki.KeyID)
 			if err != nil {
-				logger.Warn("Could not find Tink info for key during disable check. Skipping.", "keyID", ki.KeyID, "error", err)
 				continue
 			}
 
 			if tinkKeyInfo.GetStatus() == tinkpb.KeyStatusType_ENABLED {
-				logger.Info("Disabling key (phase-out period ended).", "keyID", ki.KeyID, "expected_disable_time", expectedDisableTime.Format(time.RFC3339))
-				err := manager.Disable(ki.KeyID)
-				if err != nil {
-					logger.Error("Failed to disable key.", "keyID", ki.KeyID, "error", err)
-					continue // Skip metadata update on error
+				r.logger.Info("Disabling key (phase-out period ended).", "keyID", ki.KeyID)
+				if err := r.manager.Disable(ki.KeyID); err != nil {
+					r.logger.Error("Failed to disable key.", "keyID", ki.KeyID, "error", err)
+					continue
 				}
 				ki.Metadata.State = tinkrotatev1.KeyState_KEY_STATE_DISABLED
-				ki.Metadata.DisableTime = timestamppb.New(currentTime)
-				ki.Metadata.DeletionTime = timestamppb.New(currentTime.Add(deletionGracePeriod))
-				updated = true
+				ki.Metadata.DisableTime = timestamppb.New(r.now)
+				ki.Metadata.DeletionTime = timestamppb.New(r.now.Add(deletionGracePeriod))
+				r.updated = true
 			} else if tinkKeyInfo.GetStatus() == tinkpb.KeyStatusType_DISABLED && ki.Metadata.State != tinkrotatev1.KeyState_KEY_STATE_DISABLED {
-				logger.Info("Aligning metadata for already disabled key.", "keyID", ki.KeyID)
 				ki.Metadata.State = tinkrotatev1.KeyState_KEY_STATE_DISABLED
 				if ki.Metadata.DisableTime == nil {
-					ki.Metadata.DisableTime = timestamppb.New(currentTime)
+					ki.Metadata.DisableTime = timestamppb.New(r.now)
 				}
-				if ki.Metadata.DisableTime != nil && ki.Metadata.DeletionTime == nil {
+				if ki.Metadata.DeletionTime == nil {
 					ki.Metadata.DeletionTime = timestamppb.New(ki.Metadata.DisableTime.AsTime().Add(deletionGracePeriod))
-				} else if ki.Metadata.DeletionTime == nil {
-					ki.Metadata.DeletionTime = timestamppb.New(currentTime.Add(deletionGracePeriod))
 				}
-				updated = true
+				r.updated = true
 			}
 		}
 	}
+	return nil
+}
 
-	if primaryKey != nil {
-		if primaryKey.Metadata == nil {
-			logger.Warn("Primary key missing metadata. Skipping promotion check.", "keyID", primaryKey.KeyID)
-		} else {
-			primaryExpired := false
-			expiryTimeKnown := false
-			var expectedEndTime time.Time
-			if primaryKey.Metadata.PromotionTime != nil {
-				expectedEndTime = primaryKey.Metadata.PromotionTime.AsTime().Add(primaryDuration)
-				expiryTimeKnown = true
-			} else if primaryKey.Metadata.CreationTime != nil {
-				expectedEndTime = primaryKey.Metadata.CreationTime.AsTime().Add(primaryDuration)
-				expiryTimeKnown = true
-				logger.Warn("Primary key missing promotion time. Using creation time for expiry check.", "keyID", primaryKey.KeyID)
-			} else {
-				logger.Warn("Primary key missing both promotion and creation time. Cannot check expiry.", "keyID", primaryKey.KeyID)
+func (r *rotator) handlePromotions() error {
+	primaryDuration := r.policy.PrimaryDuration.AsDuration()
+	propagationTime := r.policy.PropagationTime.AsDuration()
+
+	if r.primaryKey != nil {
+		if r.primaryKey.Metadata == nil {
+			return nil
+		}
+
+		var expectedEndTime time.Time
+		expired := false
+
+		if r.primaryKey.Metadata.PromotionTime != nil {
+			expectedEndTime = r.primaryKey.Metadata.PromotionTime.AsTime().Add(primaryDuration)
+			if !r.now.Before(expectedEndTime) {
+				expired = true
 			}
-
-			if expiryTimeKnown && !currentTime.Before(expectedEndTime) {
-				primaryExpired = true
+		} else if r.primaryKey.Metadata.CreationTime != nil {
+			expectedEndTime = r.primaryKey.Metadata.CreationTime.AsTime().Add(primaryDuration)
+			if !r.now.Before(expectedEndTime) {
+				expired = true
 			}
+		}
 
-			if primaryExpired {
-				if len(pendingKeys) > 0 {
-					promoted := false
-					for _, pendingKey := range pendingKeys {
-						if pendingKey.Metadata == nil || pendingKey.Metadata.CreationTime == nil {
-							logger.Warn("Pending key missing metadata or creation time. Skipping promotion check for this key.", "keyID", pendingKey.KeyID)
-							continue
-						}
+		if expired && len(r.pendingKeys) > 0 {
+			for _, pendingKey := range r.pendingKeys {
+				if pendingKey.Metadata == nil || pendingKey.Metadata.CreationTime == nil {
+					continue
+				}
 
-						tinkKeyInfo, err := findTinkKeyInfo(manager, pendingKey.KeyID)
-						if err != nil {
-							logger.Warn("Could not find Tink info for pending key during promotion check. Skipping.", "keyID", pendingKey.KeyID, "error", err)
-							continue
-						}
-						if tinkKeyInfo.GetStatus() != tinkpb.KeyStatusType_ENABLED {
-							logger.Warn("Pending key is not ENABLED in keyset. Skipping promotion.", "keyID", pendingKey.KeyID, "tink_status", tinkKeyInfo.GetStatus())
-							continue
-						}
+				tinkKeyInfo, err := findTinkKeyInfo(r.manager, pendingKey.KeyID)
+				if err != nil || tinkKeyInfo.GetStatus() != tinkpb.KeyStatusType_ENABLED {
+					continue
+				}
 
-						propagationEndTime := pendingKey.Metadata.CreationTime.AsTime().Add(propagationTime)
-						if !currentTime.Before(propagationEndTime) {
-							logger.Info("Promoting key to PRIMARY (Primary expired, propagation time met).", "pending_key_id", pendingKey.KeyID, "primary_key_id", primaryKey.KeyID, "primary_expiry_time", expectedEndTime.Format(time.RFC3339))
-							err := manager.SetPrimary(pendingKey.KeyID)
-							if err != nil {
-								logger.Error("Failed to promote key.", "keyID", pendingKey.KeyID, "error", err)
-								continue
-							}
-
-							primaryKey.Metadata.State = tinkrotatev1.KeyState_KEY_STATE_PHASING_OUT
-
-							pendingKey.Metadata.State = tinkrotatev1.KeyState_KEY_STATE_PRIMARY
-							pendingKey.Metadata.PromotionTime = timestamppb.New(currentTime)
-
-							updated = true
-							promoted = true
-							break
-						} else {
-							logger.Info("Primary key expired, but pending key hasn't met propagation time. Waiting.",
-								"primary_key_id", primaryKey.KeyID, "pending_key_id", pendingKey.KeyID, "propagation_time_remaining", propagationEndTime.Sub(currentTime).Round(time.Second), "propagation_end_time", propagationEndTime.Format(time.RFC3339))
-							break
-						}
+				propagationEndTime := pendingKey.Metadata.CreationTime.AsTime().Add(propagationTime)
+				if !r.now.Before(propagationEndTime) {
+					r.logger.Info("Promoting key to PRIMARY.", "keyID", pendingKey.KeyID)
+					if err := r.manager.SetPrimary(pendingKey.KeyID); err != nil {
+						r.logger.Error("Failed to promote key.", "keyID", pendingKey.KeyID, "error", err)
+						continue
 					}
-					if !promoted && len(pendingKeys) > 0 {
-						logger.Info("Primary key expired, but no suitable pending key ready for promotion yet.", "primary_key_id", primaryKey.KeyID)
-					} else if len(pendingKeys) == 0 {
-						logger.Warn("Primary key expired, but NO PENDING key available to promote.", "keyID", primaryKey.KeyID)
-					}
-				} else {
-					logger.Warn("Primary key expired, but NO PENDING key available to promote.", "keyID", primaryKey.KeyID)
+
+					r.primaryKey.Metadata.State = tinkrotatev1.KeyState_KEY_STATE_PHASING_OUT
+					pendingKey.Metadata.State = tinkrotatev1.KeyState_KEY_STATE_PRIMARY
+					pendingKey.Metadata.PromotionTime = timestamppb.New(r.now)
+
+					r.updated = true
+					// Update primaryKey pointer for subsequent logic if needed,
+					// but for now just breaking is fine as we only promote one per cycle.
+					return nil
 				}
 			}
 		}
-	} else { // No primary key exists
-		if len(pendingKeys) > 0 {
-			pendingKey := pendingKeys[0] // Oldest one
-			if pendingKey.Metadata == nil || pendingKey.Metadata.CreationTime == nil {
-				logger.Warn("Pending key missing metadata or creation time. Cannot promote.", "keyID", pendingKey.KeyID)
-			} else {
-				tinkKeyInfo, err := findTinkKeyInfo(manager, pendingKey.KeyID)
-				if err != nil {
-					logger.Warn("Could not find Tink info for pending key during initial promotion check. Skipping.", "keyID", pendingKey.KeyID, "error", err)
-				} else if tinkKeyInfo.GetStatus() != tinkpb.KeyStatusType_ENABLED {
-					logger.Warn("Pending key is not ENABLED. Cannot promote.", "keyID", pendingKey.KeyID, "tink_status", tinkKeyInfo.GetStatus())
-				} else {
-					propagationEndTime := pendingKey.Metadata.CreationTime.AsTime().Add(propagationTime)
-					if !currentTime.Before(propagationEndTime) {
-						logger.Info("Promoting key to PRIMARY (no primary exists, propagation time met).", "keyID", pendingKey.KeyID)
-						err := manager.SetPrimary(pendingKey.KeyID)
-						if err != nil {
-							logger.Error("Failed to promote key.", "keyID", pendingKey.KeyID, "error", err)
-						} else {
-							pendingKey.Metadata.State = tinkrotatev1.KeyState_KEY_STATE_PRIMARY
-							pendingKey.Metadata.PromotionTime = timestamppb.New(currentTime)
-							updated = true
-						}
+	} else if len(r.pendingKeys) > 0 {
+		// No primary key, promote oldest pending if ready
+		pendingKey := r.pendingKeys[0]
+		if pendingKey.Metadata != nil && pendingKey.Metadata.CreationTime != nil {
+			propagationEndTime := pendingKey.Metadata.CreationTime.AsTime().Add(propagationTime)
+			if !r.now.Before(propagationEndTime) {
+				tinkKeyInfo, err := findTinkKeyInfo(r.manager, pendingKey.KeyID)
+				if err == nil && tinkKeyInfo.GetStatus() == tinkpb.KeyStatusType_ENABLED {
+					r.logger.Info("Promoting key to PRIMARY (initial).", "keyID", pendingKey.KeyID)
+					if err := r.manager.SetPrimary(pendingKey.KeyID); err != nil {
+						r.logger.Error("Failed to promote key.", "keyID", pendingKey.KeyID, "error", err)
 					} else {
-						logger.Info("No primary key, pending key not ready for promotion.",
-							"pending_key_id", pendingKey.KeyID, "propagation_time_remaining", propagationEndTime.Sub(currentTime).Round(time.Second), "propagation_end_time", propagationEndTime.Format(time.RFC3339))
+						pendingKey.Metadata.State = tinkrotatev1.KeyState_KEY_STATE_PRIMARY
+						pendingKey.Metadata.PromotionTime = timestamppb.New(r.now)
+						r.updated = true
+						// We now have a primary key, but for this cycle we are done with promotions.
 					}
 				}
 			}
-		} else {
-			logger.Info("No primary key and no pending keys found.")
 		}
 	}
+	return nil
+}
 
-	// Get potentially updated handle info
-	ksInfoHandle, err := manager.Handle()
-	if err != nil {
-		// If we can't get the handle after potential changes, it's safer to return error
-		// and not proceed with generating a new key based on potentially stale info.
-		return handle, metadata, updated, fmt.Errorf("failed to get intermediate handle from manager: %w", err)
-	}
-	ksInfo = ksInfoHandle.KeysetInfo()
-	primaryKey = nil
+func (r *rotator) handleKeyGeneration() error {
+	// Re-check primary/pending status from the manager because promotions might have happened.
+	// But actually, we only updated metadata in memory.
+	// The logic: "If primaryKey != nil && !hasPending"
+
+	// We need to know if there is *currently* a pending key.
+	// We can check our r.pendingKeys list.
+	// BUT, if we just promoted a pending key to primary, it is no longer pending.
+	// So we need to re-evaluate based on the *current* state of metadata in `r`.
+
 	hasPending := false
-	// Re-scan metadata and latest KeysetInfo to determine current primary and if pending exists
-	for _, keyInfo := range ksInfo.GetKeyInfo() {
-		meta, exists := metadata.KeyMetadata[keyInfo.GetKeyId()]
-		if !exists {
+	hasPrimary := false
+
+	// Scan our tracked keys to see their current (possibly updated) state
+	allKeys := append([]*KeyInfo{}, r.primaryKey) // Primary might be nil
+	allKeys = append(allKeys, r.pendingKeys...)
+	allKeys = append(allKeys, r.phasingOutKeys...)
+	allKeys = append(allKeys, r.disabledKeys...)
+
+	for _, k := range allKeys {
+		if k == nil || k.Metadata == nil {
 			continue
-		} // Ignore keys without metadata
-
-		currentKeyInfo, kiExists := keyInfos[keyInfo.GetKeyId()]
-		if !kiExists {
-			// Should not happen if keyInfos was built correctly, but handle defensively
-			currentKeyInfo = &KeyInfo{
-				KeyID:    keyInfo.GetKeyId(),
-				Status:   keyInfo.GetStatus(),
-				Metadata: meta,
-			}
-			keyInfos[keyInfo.GetKeyId()] = currentKeyInfo
-		} else {
-			currentKeyInfo.Status = keyInfo.GetStatus() // Update status from potentially modified handle
 		}
-
-		// Determine primary based on BOTH metadata state AND Tink's view
-		if meta.State == tinkrotatev1.KeyState_KEY_STATE_PRIMARY {
-			if keyInfo.GetKeyId() == ksInfo.GetPrimaryKeyId() {
-				if primaryKey != nil {
-					// This case was logged earlier, stick with the first one encountered
-				} else {
-					primaryKey = currentKeyInfo
-				}
-			} else {
-				// Metadata says primary, but Tink disagrees. Correct metadata.
-				logger.Warn("Metadata state for key is PRIMARY, but Tink primary is different. Setting state to PHASING_OUT.", "keyID", keyInfo.GetKeyId(), "tink_primary_id", ksInfo.GetPrimaryKeyId())
-				meta.State = tinkrotatev1.KeyState_KEY_STATE_PHASING_OUT
-				meta.PromotionTime = nil
-				updated = true
-			}
-		}
-		if meta.State == tinkrotatev1.KeyState_KEY_STATE_PENDING {
+		if k.Metadata.State == tinkrotatev1.KeyState_KEY_STATE_PENDING {
 			hasPending = true
 		}
-	}
-	// If after checks, primaryKey is still nil, but Tink has a primary ID, fix metadata
-	if primaryKey == nil && ksInfo.GetPrimaryKeyId() != 0 {
-		tinkPrimaryId := ksInfo.GetPrimaryKeyId()
-		meta, exists := metadata.KeyMetadata[tinkPrimaryId]
-		if exists {
-			if meta.State != tinkrotatev1.KeyState_KEY_STATE_PRIMARY {
-				logger.Warn("Tink primary key's metadata state was not PRIMARY. Setting metadata state to PRIMARY.", "tink_primary_id", tinkPrimaryId, "previous_metadata_state", meta.State)
-				meta.State = tinkrotatev1.KeyState_KEY_STATE_PRIMARY
-				if meta.PromotionTime == nil { // Set promotion time if missing
-					meta.PromotionTime = timestamppb.New(currentTime)
-				}
-				primaryKey = keyInfos[tinkPrimaryId] // Update local variable
-				updated = true
-			}
-			// If state was already primary, primaryKey should have been set unless keyInfos map was incomplete
-		} else {
-			logger.Error("Tink primary key has no corresponding metadata!", "tink_primary_id", tinkPrimaryId)
-			// This is a critical inconsistency, potentially halt? For now, we logged the error.
+		if k.Metadata.State == tinkrotatev1.KeyState_KEY_STATE_PRIMARY {
+			hasPrimary = true
 		}
 	}
 
-	if primaryKey != nil && !hasPending {
-		logger.Info("Generating new PENDING key (Primary exists, no pending key found).", "primary_key_id", primaryKey.KeyID)
-		keyID, err := manager.Add(keyTemplate)
+	if hasPrimary && !hasPending {
+		r.logger.Info("Generating new PENDING key.")
+		keyID, err := r.manager.Add(r.policy.KeyTemplate)
 		if err != nil {
-			// Error adding key, return previous state and error
-			return handle, metadata, updated, fmt.Errorf("failed to add new key to manager: %w", err)
+			return fmt.Errorf("failed to add new key: %w", err)
 		}
+
 		newMeta := &tinkrotatev1.KeyMetadata{
 			KeyId:        keyID,
 			State:        tinkrotatev1.KeyState_KEY_STATE_PENDING,
-			CreationTime: timestamppb.New(currentTime),
+			CreationTime: timestamppb.New(r.now),
 		}
-		metadata.KeyMetadata[keyID] = newMeta
-		updated = true
-		logger.Info("Generated new PENDING key.", "keyID", keyID)
+		r.metadata.KeyMetadata[keyID] = newMeta
+		r.updated = true
+		r.logger.Info("Generated new PENDING key.", "keyID", keyID)
 	}
 
-	var finalHandle *keyset.Handle
-	if updated {
-		finalHandle, err = manager.Handle()
-		if err != nil {
-			// Failed to get the *final* handle after all updates.
-			return handle, metadata, updated, fmt.Errorf("failed to get final handle from manager: %w", err)
-		}
-	} else {
-		finalHandle = handle
-	}
-
-	// Final consistency check before returning?
-	finalInconsistencies := CheckConsistency(finalHandle, metadata)
-	if len(finalInconsistencies) > 0 {
-		logger.Warn("Inconsistencies found *after* rotation attempt. Returning potentially inconsistent state.", "inconsistencies", finalInconsistencies)
-		// Decide: return error, or return the state anyway? Returning state for now.
-	}
-
-	return finalHandle, metadata, updated, nil
+	return nil
 }
 
 // Helper to find Tink KeyInfo within a manager/handle
 func findTinkKeyInfo(m *keyset.Manager, keyID uint32) (*tinkpb.KeysetInfo_KeyInfo, error) {
-	h, err := m.Handle() // Get current handle state from manager
+	h, err := m.Handle()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get handle from manager: %w", err)
+		return nil, fmt.Errorf("failed to get handle: %w", err)
 	}
 	for _, ki := range h.KeysetInfo().GetKeyInfo() {
 		if ki.GetKeyId() == keyID {
 			return ki, nil
 		}
 	}
-	return nil, fmt.Errorf("key ID %d not found in keyset", keyID)
+	return nil, fmt.Errorf("key ID %d not found", keyID)
 }
 
 // KeyInfo helper struct
@@ -500,12 +432,9 @@ type KeyInfo struct {
 }
 
 // CheckConsistency verifies state between KeysetHandle and KeyRotationMetadata.
-// It needs to handle the new structure of KeyRotationMetadata.
 func CheckConsistency(handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationMetadata) []error {
 	var inconsistencies []error
-
-	// This could be passed in if CheckConsistency is used in other contexts needing specific logging.
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil)).With("function", "CheckConsistency")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	if handle == nil {
 		inconsistencies = append(inconsistencies, errors.New("keyset handle is nil"))
@@ -513,59 +442,42 @@ func CheckConsistency(handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationM
 	}
 	ksInfo := handle.KeysetInfo()
 
-	// --- Validate Metadata Structure ---
 	if metadata == nil {
 		if len(ksInfo.GetKeyInfo()) > 0 {
 			inconsistencies = append(inconsistencies, errors.New("metadata is nil, but keyset handle contains keys"))
 		}
-		return inconsistencies // Cannot proceed without metadata
+		return inconsistencies
 	}
-	// Rotation policy is now required for rotation, check if it's present.
-	// We don't necessarily need to validate its contents here, RotateKeyset does that.
-	if metadata.RotationPolicy == nil && len(ksInfo.GetKeyInfo()) > 0 { // Only require policy if keys exist
-		inconsistencies = append(inconsistencies, errors.New("metadata.RotationPolicy is nil, but keyset handle contains keys"))
+
+	if metadata.RotationPolicy == nil && len(ksInfo.GetKeyInfo()) > 0 {
+		inconsistencies = append(inconsistencies, errors.New("metadata.RotationPolicy is nil"))
 	}
 	if metadata.KeyMetadata == nil {
-		metadata.KeyMetadata = make(map[uint32]*tinkrotatev1.KeyMetadata) // Treat nil map as empty
-		if len(ksInfo.GetKeyInfo()) > 0 {
-			inconsistencies = append(inconsistencies, errors.New("metadata.KeyMetadata map is nil/empty, but keyset handle contains keys"))
-		}
+		metadata.KeyMetadata = make(map[uint32]*tinkrotatev1.KeyMetadata)
 	}
 
 	tinkKeyIDs := make(map[uint32]*tinkpb.KeysetInfo_KeyInfo)
 	for _, ki := range ksInfo.GetKeyInfo() {
-		if ki == nil {
-			continue // Should not happen, but defensive check
-		}
 		tinkKeyIDs[ki.GetKeyId()] = ki
 	}
 
 	metadataKeyIDs := make(map[uint32]*tinkrotatev1.KeyMetadata)
 	for kID, meta := range metadata.KeyMetadata {
 		if meta == nil {
-			inconsistencies = append(inconsistencies, fmt.Errorf("metadata map contains nil entry for key ID %d", kID))
-			continue // Skip nil metadata entries
-		}
-		if meta.KeyId != kID {
-			inconsistencies = append(inconsistencies, fmt.Errorf("metadata map key %d does not match metadata message KeyId %d", kID, meta.KeyId))
+			continue
 		}
 		metadataKeyIDs[kID] = meta
 	}
 
-	// Check if all keys in Tink handle exist in metadata
 	for kID := range tinkKeyIDs {
 		if _, exists := metadataKeyIDs[kID]; !exists {
-			inconsistencies = append(inconsistencies, fmt.Errorf("key ID %d exists in keyset handle but not in metadata", kID))
+			inconsistencies = append(inconsistencies, fmt.Errorf("key ID %d missing from metadata", kID))
 		}
 	}
 
-	// Check if all keys in metadata exist in Tink handle
 	for kID := range metadataKeyIDs {
 		if _, exists := tinkKeyIDs[kID]; !exists {
-			// It's possible the key was DESTROYED, which is valid if metadata state is DISABLED/past deletion time.
-			// However, ideally, the metadata entry should be removed upon destruction.
-			// Let's flag it as an inconsistency for now.
-			inconsistencies = append(inconsistencies, fmt.Errorf("key ID %d exists in metadata but not in keyset handle (was it destroyed without metadata cleanup?)", kID))
+			inconsistencies = append(inconsistencies, fmt.Errorf("metadata key ID %d missing from keyset", kID))
 		}
 	}
 
@@ -574,7 +486,6 @@ func CheckConsistency(handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationM
 	primaryCount := 0
 
 	for kID, meta := range metadataKeyIDs {
-		// Only check keys that actually exist in the handle for primary status consistency
 		if _, exists := tinkKeyIDs[kID]; !exists {
 			continue
 		}
@@ -585,88 +496,41 @@ func CheckConsistency(handle *keyset.Handle, metadata *tinkrotatev1.KeyRotationM
 	}
 
 	if tinkPrimaryID != 0 {
-		// Handle has a primary key
 		if primaryCount == 0 {
-			inconsistencies = append(inconsistencies, fmt.Errorf("keyset handle primary ID is %d, but no key found with state PRIMARY in metadata", tinkPrimaryID))
+			inconsistencies = append(inconsistencies, fmt.Errorf("keyset primary %d not marked PRIMARY in metadata", tinkPrimaryID))
 		} else if primaryCount > 1 {
-			inconsistencies = append(inconsistencies, fmt.Errorf("multiple keys (%d found) have state PRIMARY in metadata", primaryCount))
-		} else {
-			// Exactly one primary found in metadata
-			if metadataPrimaryID != tinkPrimaryID {
-				inconsistencies = append(inconsistencies, fmt.Errorf("keyset handle primary ID is %d, but metadata PRIMARY key ID is %d", tinkPrimaryID, metadataPrimaryID))
-			}
-			// Double check the state of the key Tink thinks is primary
-			metaForTinkPrimary, exists := metadataKeyIDs[tinkPrimaryID]
-			if !exists {
-				// This case should be caught by check #1 already, but belt-and-suspenders
-				inconsistencies = append(inconsistencies, fmt.Errorf("keyset handle primary ID %d does not exist in metadata", tinkPrimaryID))
-			} else if metaForTinkPrimary.State != tinkrotatev1.KeyState_KEY_STATE_PRIMARY {
-				inconsistencies = append(inconsistencies, fmt.Errorf("keyset handle primary ID is %d, but its metadata state is %s (expected PRIMARY)", tinkPrimaryID, metaForTinkPrimary.State))
-			}
-		}
-	} else {
-		// Handle has NO primary key
-		if primaryCount > 0 {
-			inconsistencies = append(inconsistencies, fmt.Errorf("keyset handle has no primary key, but metadata key ID %d has state PRIMARY", metadataPrimaryID))
+			inconsistencies = append(inconsistencies, fmt.Errorf("multiple keys marked PRIMARY in metadata"))
+		} else if metadataPrimaryID != tinkPrimaryID {
+			inconsistencies = append(inconsistencies, fmt.Errorf("keyset primary %d mismatch metadata primary %d", tinkPrimaryID, metadataPrimaryID))
 		}
 	}
 
 	for kID, tinkInfo := range tinkKeyIDs {
-		meta, metaExists := metadataKeyIDs[kID]
-		// If metadata doesn't exist, it was already flagged in check #1. Skip status check.
-		if !metaExists {
+		meta, exists := metadataKeyIDs[kID]
+		if !exists {
 			continue
 		}
-
 		tinkStatus := tinkInfo.GetStatus()
 		metaState := meta.State
 
-		// Check for contradictions based on metadata state
 		switch metaState {
-		case tinkrotatev1.KeyState_KEY_STATE_PENDING, tinkrotatev1.KeyState_KEY_STATE_PHASING_OUT:
-			// Should be ENABLED in Tink
+		case tinkrotatev1.KeyState_KEY_STATE_PENDING, tinkrotatev1.KeyState_KEY_STATE_PHASING_OUT, tinkrotatev1.KeyState_KEY_STATE_PRIMARY:
 			if tinkStatus != tinkpb.KeyStatusType_ENABLED {
-				inconsistencies = append(inconsistencies, fmt.Errorf("key ID %d: metadata state is %s, but Tink status is %s (expected ENABLED)", kID, metaState, tinkStatus))
-			}
-		case tinkrotatev1.KeyState_KEY_STATE_PRIMARY:
-			// Should be ENABLED in Tink (and match primary ID, checked above)
-			if tinkStatus != tinkpb.KeyStatusType_ENABLED {
-				inconsistencies = append(inconsistencies, fmt.Errorf("key ID %d: metadata state is PRIMARY, but Tink status is %s (expected ENABLED)", kID, tinkStatus))
+				inconsistencies = append(inconsistencies, fmt.Errorf("key %d state %s but status %s", kID, metaState, tinkStatus))
 			}
 		case tinkrotatev1.KeyState_KEY_STATE_DISABLED:
-			// Should be DISABLED in Tink
-			if tinkStatus != tinkpb.KeyStatusType_DISABLED {
-				// Allow ENABLED/UNKNOWN only if RAW key? No, Tink disables non-raw keys too.
-				// If it's ENABLED, that's a definite mismatch. If DESTROYED, it shouldn't be in tinkKeyIDs.
-				if tinkStatus != tinkpb.KeyStatusType_DESTROYED {
-					inconsistencies = append(inconsistencies, fmt.Errorf("key ID %d: metadata state is DISABLED, but Tink status is %s (expected DISABLED or DESTROYED)", kID, tinkStatus))
-				}
+			if tinkStatus != tinkpb.KeyStatusType_DISABLED && tinkStatus != tinkpb.KeyStatusType_DESTROYED {
+				inconsistencies = append(inconsistencies, fmt.Errorf("key %d state DISABLED but status %s", kID, tinkStatus))
 			}
-		case tinkrotatev1.KeyState_KEY_STATE_UNSPECIFIED:
-			inconsistencies = append(inconsistencies, fmt.Errorf("key ID %d: metadata state is UNSPECIFIED", kID))
 		}
 
-		// Check for contradictions based on Tink status
 		switch tinkStatus {
 		case tinkpb.KeyStatusType_ENABLED:
-			if metaState != tinkrotatev1.KeyState_KEY_STATE_PENDING && metaState != tinkrotatev1.KeyState_KEY_STATE_PRIMARY && metaState != tinkrotatev1.KeyState_KEY_STATE_PHASING_OUT {
-				inconsistencies = append(inconsistencies, fmt.Errorf("key ID %d: Tink status is ENABLED, but metadata state is %s (expected PENDING, PRIMARY, or PHASING_OUT)", kID, metaState))
+			if metaState == tinkrotatev1.KeyState_KEY_STATE_DISABLED {
+				inconsistencies = append(inconsistencies, fmt.Errorf("key %d status ENABLED but state DISABLED", kID))
 			}
-		case tinkpb.KeyStatusType_DISABLED:
-			if metaState != tinkrotatev1.KeyState_KEY_STATE_DISABLED {
-				inconsistencies = append(inconsistencies, fmt.Errorf("key ID %d: Tink status is DISABLED, but metadata state is %s (expected DISABLED)", kID, metaState))
-			}
-		case tinkpb.KeyStatusType_DESTROYED:
-			// This case means the key is in KeysetInfo but marked as DESTROYED.
-			// Metadata should ideally reflect this by being in DISABLED state and due for removal, or already removed.
-			// If metadata still exists and isn't DISABLED, it's an inconsistency.
-			if metaState != tinkrotatev1.KeyState_KEY_STATE_DISABLED {
-				inconsistencies = append(inconsistencies, fmt.Errorf("key ID %d: Tink status is DESTROYED, but metadata state is %s (expected DISABLED or metadata to be removed)", kID, metaState))
-			}
-			// If key is DESTROYED, it might be fine for metadata to be KEY_STATE_DISABLED.
-			// The key will be removed from metadata by the deletion logic in RotateKeyset.
 		case tinkpb.KeyStatusType_UNKNOWN_STATUS:
-			logger.Warn("Key found with UNKNOWN_STATUS in Tink.", "keyID", kID)
+			logger.Warn("Key found with UNKNOWN_STATUS", "keyID", kID)
 		}
 	}
 

@@ -9,7 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/uuid"
-	"github.com/lstoll/tinkrotate/s3store"
+	"lds.li/tinkrotate/s3store"
 )
 
 func TestAutoRotator_S3_BlackBox(t *testing.T) {

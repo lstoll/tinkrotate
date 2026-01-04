@@ -1,17 +1,17 @@
-module github.com/lstoll/tinkrotate/s3store
+module lds.li/tinkrotate/s3store
 
-go 1.24
+go 1.24.0
 
-require github.com/lstoll/tinkrotate v0.0.0
+require lds.li/tinkrotate v0.0.0
 
-replace github.com/lstoll/tinkrotate => ../
+replace lds.li/tinkrotate => ../
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.36.3
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.79.2
 	github.com/aws/smithy-go v1.22.3
-	github.com/tink-crypto/tink-go/v2 v2.4.0
-	google.golang.org/protobuf v1.36.6
+	github.com/tink-crypto/tink-go/v2 v2.6.0
+	google.golang.org/protobuf v1.36.8
 )
 
 require (
@@ -23,4 +23,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/internal/checksum v1.7.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.12.15 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/s3shared v1.18.15 // indirect
+	golang.org/x/crypto v0.41.0 // indirect
+	golang.org/x/sys v0.35.0 // indirect
 )

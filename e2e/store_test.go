@@ -17,8 +17,8 @@ import (
 	"github.com/tink-crypto/tink-go/v2/keyset"
 
 	// Import your local package and the generated protobuf package
-	"github.com/lstoll/tinkrotate" // Adjust import path for keyrotation package
-	tinkrotatev1 "github.com/lstoll/tinkrotate/proto/tinkrotate/v1"
+	"lds.li/tinkrotate" // Adjust import path for keyrotation package
+	tinkrotatev1 "lds.li/tinkrotate/proto/tinkrotate/v1"
 )
 
 // Helper function to get key metadata state or UNSPECIFIED if not found
