@@ -205,20 +205,20 @@ func (s *S3Store) WriteKeysetAndMetadata(ctx context.Context, keysetName string,
 			return tinkrotate.ErrOptimisticLockFailed
 		}
 
-		return fmt.Errorf("failed to put object %s/%s to S3: %w", s.bucket, s.objectKey, err)
+		return fmt.Errorf("failed to put object %s to S3: %w", s.objectKey(keysetName), err)
 	}
 
 	return nil
 }
 
-func (s *S3Store) GetCurrentHandle(ctx context.Context, keysetName string) (*keyset.Handle, error) {
-	slog.Debug("S3Store: GetCurrentHandle called", "bucket", s.bucket, "objectKey", s.objectKey(keysetName))
+func (s *S3Store) GetHandle(ctx context.Context, keysetName string) (*keyset.Handle, error) {
+	slog.Debug("S3Store: GetHandle called", "bucket", s.bucket, "objectKey", s.objectKey(keysetName))
 	readResult, err := s.ReadKeysetAndMetadata(ctx, keysetName)
 	if err != nil {
 		if errors.Is(err, tinkrotate.ErrKeysetNotFound) {
 			return nil, fmt.Errorf("keyset '%s': %w", s.objectKey(keysetName), tinkrotate.ErrKeysetNotFound)
 		}
-		return nil, fmt.Errorf("failed to read for GetCurrentHandle: %w", err)
+		return nil, fmt.Errorf("failed to read for GetHandle: %w", err)
 	}
 	if readResult.Handle == nil {
 		return nil, fmt.Errorf("internal error: ReadKeysetAndMetadata succeeded but returned nil handle for %s", s.objectKey(keysetName))
@@ -226,9 +226,9 @@ func (s *S3Store) GetCurrentHandle(ctx context.Context, keysetName string) (*key
 	return readResult.Handle, nil
 }
 
-func (s *S3Store) GetPublicKeySetHandle(ctx context.Context, keysetName string) (*keyset.Handle, error) {
-	slog.Debug("S3Store: GetPublicKeySetHandle called", "bucket", s.bucket, "objectKey", s.objectKey(keysetName))
-	fullHandle, err := s.GetCurrentHandle(ctx, keysetName)
+func (s *S3Store) GetPublicHandle(ctx context.Context, keysetName string) (*keyset.Handle, error) {
+	slog.Debug("S3Store: GetPublicHandle called", "bucket", s.bucket, "objectKey", s.objectKey(keysetName))
+	fullHandle, err := s.GetHandle(ctx, keysetName)
 	if err != nil {
 		return nil, err
 	}

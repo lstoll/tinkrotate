@@ -9,19 +9,22 @@ import (
 )
 
 var (
-	ErrKeysetNotFound = errors.New("keyset not found")
+	ErrKeysetNotFound       = errors.New("keyset not found")
 	ErrOptimisticLockFailed = errors.New("optimistic lock failed: keyset or metadata modified concurrently")
 )
 
 type ReadResult struct {
 	Handle   *keyset.Handle
 	Metadata *tinkrotatev1.KeyRotationMetadata
-	Context any
+	Context  any
 }
 
 type Store interface {
-	GetCurrentHandle(ctx context.Context, keysetName string) (*keyset.Handle, error)
-	GetPublicKeySetHandle(ctx context.Context, keysetName string) (*keyset.Handle, error)
+	// GetHandle returns the handle for the given keyset name.
+	GetHandle(ctx context.Context, keysetName string) (*keyset.Handle, error)
+	// GetPublicHandle returns the handle for the given keyset name, with only
+	// the public key material.
+	GetPublicHandle(ctx context.Context, keysetName string) (*keyset.Handle, error)
 }
 
 type ManagedStore interface {
