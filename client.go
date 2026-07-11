@@ -9,6 +9,7 @@ import (
 	"github.com/tink-crypto/tink-go/v2/aead"
 	"github.com/tink-crypto/tink-go/v2/jwt"
 	"github.com/tink-crypto/tink-go/v2/keyset"
+	"github.com/tink-crypto/tink-go/v2/mac"
 	"github.com/tink-crypto/tink-go/v2/tink"
 )
 
@@ -50,6 +51,12 @@ func (f *PrimitiveSource) GetSigner(keysetName string) (ContextBoundSigner, erro
 func (f *PrimitiveSource) GetVerifier(keysetName string) (ContextBoundVerifier, error) {
 	hp := newHandleProvider(f.store, keysetName, f.cacheTTL)
 	return &dynamicVerifier{hp: hp}, nil
+}
+
+// GetMAC returns a dynamic tink.MAC backed by the named keyset.
+func (f *PrimitiveSource) GetMAC(keysetName string) (ContextBoundMAC, error) {
+	hp := newHandleProvider(f.store, keysetName, f.cacheTTL)
+	return &dynamicMAC{hp: hp}, nil
 }
 
 // handleProvider manages the caching and retrieval of a keyset handle.
@@ -214,6 +221,49 @@ func (d *dynamicVerifier) VerifyAndDecode(token string, validator *jwt.Validator
 
 func (d *dynamicVerifier) WithContext(ctx context.Context) ContextBoundVerifier {
 	return &dynamicVerifier{
+		hp:  d.hp,
+		ctx: ctx,
+	}
+}
+
+// --- MAC ---
+
+type ContextBoundMAC interface {
+	tink.MAC
+	WithContext(ctx context.Context) ContextBoundMAC
+}
+
+type dynamicMAC struct {
+	hp  *handleProvider
+	ctx context.Context
+}
+
+func (d *dynamicMAC) ComputeMAC(data []byte) ([]byte, error) {
+	h, err := d.hp.getHandle(d.ctx)
+	if err != nil {
+		return nil, err
+	}
+	m, err := mac.New(h)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create MAC primitive: %w", err)
+	}
+	return m.ComputeMAC(data)
+}
+
+func (d *dynamicMAC) VerifyMAC(macBytes, data []byte) error {
+	h, err := d.hp.getHandle(d.ctx)
+	if err != nil {
+		return err
+	}
+	m, err := mac.New(h)
+	if err != nil {
+		return fmt.Errorf("failed to create MAC primitive: %w", err)
+	}
+	return m.VerifyMAC(macBytes, data)
+}
+
+func (d *dynamicMAC) WithContext(ctx context.Context) ContextBoundMAC {
+	return &dynamicMAC{
 		hp:  d.hp,
 		ctx: ctx,
 	}

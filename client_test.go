@@ -9,6 +9,7 @@ import (
 	"github.com/tink-crypto/tink-go/v2/aead"
 	"github.com/tink-crypto/tink-go/v2/jwt"
 	"github.com/tink-crypto/tink-go/v2/keyset"
+	"github.com/tink-crypto/tink-go/v2/mac"
 )
 
 type mockStore struct {
@@ -173,5 +174,34 @@ func TestPrimitiveSource_SignerVerifier(t *testing.T) {
 	// So ms.calls should be 2.
 	if len(ms.calls) != 2 {
 		t.Errorf("expected 2 calls (1 signer, 1 verifier), got %d", len(ms.calls))
+	}
+}
+
+func TestPrimitiveSource_MAC(t *testing.T) {
+	kh, err := keyset.NewHandle(mac.HMACSHA256Tag256KeyTemplate())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ms := &mockStore{handle: kh}
+	source := NewPrimitiveSource(ms, time.Minute)
+
+	macPrim, err := source.GetMAC("session-mac")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tag, err := macPrim.ComputeMAC([]byte("session-id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := macPrim.VerifyMAC(tag, []byte("session-id")); err != nil {
+		t.Fatalf("verify MAC: %v", err)
+	}
+	if err := macPrim.VerifyMAC(tag, []byte("wrong")); err == nil {
+		t.Fatal("expected verify to fail for wrong data")
+	}
+	if len(ms.calls) != 1 {
+		t.Errorf("expected 1 handle fetch (cached), got %d", len(ms.calls))
 	}
 }
